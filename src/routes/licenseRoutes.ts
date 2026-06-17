@@ -24,7 +24,8 @@ const transferParams = z.object({
 
 const transferBody = z.object({
   fromUserId: z.coerce.bigint(),
-  toUserId: z.coerce.bigint()
+  toUserId: z.coerce.bigint(),
+  universeId: z.coerce.bigint()
 });
 
 const tradeHistoryQuery = z.object({
@@ -34,6 +35,7 @@ const tradeHistoryQuery = z.object({
 const claimBody = z.object({
   userId: z.coerce.bigint(),
   gamepassId: z.coerce.bigint(),
+  universeId: z.coerce.bigint(),
   secret: z.string()
 });
 
@@ -129,10 +131,20 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
     }
 
     const { licenseId } = parsedParams.data;
-    const { fromUserId, toUserId } = parsedBody.data;
+    const { fromUserId, toUserId, universeId } = parsedBody.data;
 
     if (fromUserId === toUserId) {
       return reply.badRequest("fromUserId and toUserId must be different.");
+    }
+
+    // Validate that transfer is only allowed from trading universe
+    const tradingUniverseId = process.env.TRADING_UNIVERSE_ID;
+    if (!tradingUniverseId) {
+      return reply.internalServerError("TRADING_UNIVERSE_ID not configured.");
+    }
+
+    if (universeId.toString() !== tradingUniverseId) {
+      return reply.status(403).send({ error: "Transfers are only allowed from the trading game." });
     }
 
     try {
@@ -304,18 +316,32 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
 
     const { userId } = parsedParams.data;
 
+    const syncBody = z.object({
+      universeId: z.coerce.bigint()
+    });
+
+    const parsedBody = syncBody.safeParse(request.body);
+    if (!parsedBody.success) {
+      return reply.badRequest("Invalid request body. universeId is required.");
+    }
+
+    const { universeId } = parsedBody.data;
+
     try {
-      // Get all registered gamepasses from database
+      // Get all registered gamepasses from database for this universe
       const purchaseSources = await prisma.purchaseSource.findMany({
+        where: {
+          universeId: universeId
+        },
         include: {
           licenseType: true
         }
       });
 
-      request.log.info(`Found ${purchaseSources.length} purchase sources in database`);
+      request.log.info(`Found ${purchaseSources.length} purchase sources in database for universe ${universeId}`);
 
       // Get gamepasses user owns on Roblox
-      const ownedGamepasses = await getUserGamepasses(userId);
+      const ownedGamepasses = await getUserGamepasses(userId, universeId);
 
       request.log.info(`User ${userId} owns ${ownedGamepasses.length} gamepasses on Roblox: ${ownedGamepasses.map(id => id.toString()).join(', ')}`);
 
@@ -386,6 +412,7 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
       return reply.send({
         data: {
           userId: userId.toString(),
+          universeId: universeId.toString(),
           createdCount: createdLicenses.length,
           createdLicenses
         }
@@ -405,7 +432,7 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
       return reply.badRequest("Invalid request body.");
     }
 
-    const { userId, gamepassId, secret } = parsedBody.data;
+    const { userId, gamepassId, universeId, secret } = parsedBody.data;
 
     // Verify secret (you should set this as an environment variable)
     const expectedSecret = process.env.CLAIM_SECRET || "your-claim-secret-change-this";
@@ -418,7 +445,7 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
       const purchaseSource = await prisma.purchaseSource.findUnique({
         where: {
           universeId_gamepassId: {
-            universeId: BigInt(process.env.ROBLOX_UNIVERSE_ID || "0"),
+            universeId: universeId,
             gamepassId
           }
         },
