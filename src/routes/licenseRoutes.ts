@@ -39,6 +39,14 @@ const claimBody = z.object({
   secret: z.string()
 });
 
+const executeTradeBody = z.object({
+  fromUserId: z.coerce.bigint(),
+  toUserId: z.coerce.bigint(),
+  universeId: z.coerce.bigint(),
+  fromLicenses: z.array(z.string().uuid()),
+  toLicenses: z.array(z.string().uuid())
+});
+
 export async function registerLicenseRoutes(app: FastifyInstance) {
   app.get("/v1/players/:userId/licenses", async (request, reply) => {
     const parsedParams = playerParams.safeParse(request.params);
@@ -247,6 +255,172 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
         }
         if (error.message === "LICENSE_NOT_FOUND") {
           return reply.status(404).send({ error: "License not found." });
+        }
+      }
+      throw error;
+    }
+  });
+
+  app.post("/v1/trades/execute", async (request, reply) => {
+    const parsedBody = executeTradeBody.safeParse(request.body);
+    if (!parsedBody.success) {
+      return reply.badRequest("Invalid request body.");
+    }
+
+    const { fromUserId, toUserId, universeId, fromLicenses, toLicenses } = parsedBody.data;
+
+    if (fromUserId === toUserId) {
+      return reply.badRequest("fromUserId and toUserId must be different.");
+    }
+
+    if (fromLicenses.length === 0 && toLicenses.length === 0) {
+      return reply.badRequest("At least one license must be specified in the trade.");
+    }
+
+    // Validate that transfer is only allowed from trading universe
+    const tradingUniverseId = process.env.TRADING_UNIVERSE_ID;
+    if (!tradingUniverseId) {
+      return reply.internalServerError("TRADING_UNIVERSE_ID not configured.");
+    }
+
+    if (universeId.toString() !== tradingUniverseId) {
+      return reply.status(403).send({ error: "Transfers are only allowed from the trading game." });
+    }
+
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        // Lock all licenses from both sides
+        const allLicenseIds = [...fromLicenses, ...toLicenses];
+        
+        const lockedLicenses = await tx.license.findMany({
+          where: {
+            id: { in: allLicenseIds },
+            status: LicenseStatus.ACTIVE
+          },
+          include: { licenseType: true }
+        });
+
+        if (lockedLicenses.length !== allLicenseIds.length) {
+          throw new Error("ONE_OR_MORE_LICENSES_NOT_FOUND_OR_NOT_ACTIVE");
+        }
+
+        // Verify ownership of all licenses
+        for (const license of lockedLicenses) {
+          const isFromSide = fromLicenses.includes(license.id);
+          const expectedOwner = isFromSide ? fromUserId : toUserId;
+          
+          if (license.ownerUserId !== expectedOwner) {
+            throw new Error("LICENSE_OWNERSHIP_MISMATCH");
+          }
+        }
+
+        // Check non-stackable constraints for all recipients
+        for (const license of lockedLicenses) {
+          if (!license.licenseType.stackable) {
+            const isFromSide = fromLicenses.includes(license.id);
+            const recipient = isFromSide ? toUserId : fromUserId;
+            
+            const recipientExisting = await tx.license.findFirst({
+              where: {
+                ownerUserId: recipient,
+                licenseTypeId: license.licenseTypeId,
+                status: LicenseStatus.ACTIVE
+              },
+              select: { id: true }
+            });
+
+            if (recipientExisting) {
+              throw new Error("RECIPIENT_ALREADY_HAS_NON_STACKABLE_LICENSE");
+            }
+          }
+        }
+
+        // Lock all licenses
+        await tx.license.updateMany({
+          where: {
+            id: { in: allLicenseIds }
+          },
+          data: {
+            status: LicenseStatus.LOCKED_IN_TRADE
+          }
+        });
+
+        // Create trade record
+        const trade = await tx.trade.create({
+          data: {
+            initiatorUserId: fromUserId,
+            counterpartyUserId: toUserId,
+            status: TradeStatus.COMPLETED,
+            completedAt: new Date()
+          }
+        });
+
+        // Create trade items and transfer licenses
+        const transferredLicenses = [];
+
+        for (const license of lockedLicenses) {
+          const isFromSide = fromLicenses.includes(license.id);
+          const newOwner = isFromSide ? toUserId : fromUserId;
+          const side = isFromSide ? TradeSide.INITIATOR : TradeSide.COUNTERPARTY;
+          const originalOwner = license.ownerUserId;
+
+          await tx.tradeItem.create({
+            data: {
+              tradeId: trade.id,
+              side: side,
+              licenseId: license.id,
+              fromUserId: originalOwner
+            }
+          });
+
+          const updatedLicense = await tx.license.update({
+            where: { id: license.id },
+            data: {
+              ownerUserId: newOwner,
+              status: LicenseStatus.ACTIVE,
+              origin: LicenseOrigin.TRADE
+            }
+          });
+
+          await tx.ownershipEvent.create({
+            data: {
+              licenseId: license.id,
+              fromUserId: originalOwner,
+              toUserId: newOwner,
+              reason: "TRADE_TRANSFER",
+              tradeId: trade.id
+            }
+          });
+
+          transferredLicenses.push({
+            licenseId: updatedLicense.id,
+            fromUserId: originalOwner.toString(),
+            toUserId: newOwner.toString()
+          });
+        }
+
+        return { trade, transferredLicenses };
+      });
+
+      return reply.send({
+        data: {
+          tradeId: result.trade.id,
+          fromUserId: fromUserId.toString(),
+          toUserId: toUserId.toString(),
+          transferredAt: result.trade.completedAt,
+          transferredLicenses: result.transferredLicenses
+        }
+      });
+    } catch (error) {
+      if (error instanceof Error) {
+        if (error.message === "ONE_OR_MORE_LICENSES_NOT_FOUND_OR_NOT_ACTIVE") {
+          return reply.status(409).send({ error: "One or more licenses are not active or not owned by the specified users." });
+        }
+        if (error.message === "LICENSE_OWNERSHIP_MISMATCH") {
+          return reply.status(409).send({ error: "License ownership mismatch. One or more licenses are not owned by the specified users." });
+        }
+        if (error.message === "RECIPIENT_ALREADY_HAS_NON_STACKABLE_LICENSE") {
+          return reply.status(409).send({ error: "One or more recipients already owns a non-stackable license type from this trade." });
         }
       }
       throw error;
