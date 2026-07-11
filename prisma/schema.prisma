@@ -63,7 +63,7 @@ model Purchase {
   licenseType     LicenseType @relation(fields: [licenseTypeId], references: [id], onDelete: Restrict)
   license         License?
 
-  @@unique([buyerUserId, licenseTypeId])
+  @@unique([buyerUserId, licenseTypeId], name: "buyerUserId_licenseTypeId")
   @@index([licenseTypeId])
 }
 

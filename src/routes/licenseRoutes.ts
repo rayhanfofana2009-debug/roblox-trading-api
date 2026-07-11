@@ -534,6 +534,18 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
       const existingLicenseTypeIds = new Set(existingLicenses.map(l => l.licenseTypeId));
       const createdLicenses = [];
 
+      // Check for existing purchases (one license per gamepass lifetime)
+      const existingPurchases = await prisma.purchase.findMany({
+        where: {
+          buyerUserId: userId
+        },
+        select: {
+          licenseTypeId: true
+        }
+      });
+
+      const purchasedLicenseTypeIds = new Set(existingPurchases.map(p => p.licenseTypeId));
+
       // Create missing licenses for owned gamepasses
       for (const source of purchaseSources) {
         request.log.info(`Checking gamepass ${source.gamepassId} -> license type ${source.licenseTypeId}`);
@@ -552,15 +564,31 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
           continue;
         }
 
+        // Check if user has already used this gamepass to claim a license (one-time per gamepass)
+        if (purchasedLicenseTypeIds.has(source.licenseTypeId)) {
+          request.log.info(`User already claimed license from this gamepass type ${source.licenseTypeId} (one-time use)`);
+          continue;
+        }
+
         request.log.info(`Creating license for type ${source.licenseTypeId}`);
 
-        // Create license
+        // Create purchase record (one-time per gamepass per user)
+        const purchase = await prisma.purchase.create({
+          data: {
+            robloxReceiptId: `sync_${userId}_${source.licenseTypeId}_${Date.now()}`,
+            buyerUserId: userId,
+            licenseTypeId: source.licenseTypeId
+          }
+        });
+
+        // Create license linked to purchase
         const license = await prisma.license.create({
           data: {
             licenseTypeId: source.licenseTypeId,
             ownerUserId: userId,
             status: LicenseStatus.ACTIVE,
-            origin: LicenseOrigin.PURCHASE
+            origin: LicenseOrigin.PURCHASE,
+            createdFromPurchaseId: purchase.id
           },
           include: {
             licenseType: true
@@ -572,7 +600,8 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
           data: {
             licenseId: license.id,
             toUserId: userId,
-            reason: "SYNC_FROM_ROBLOX"
+            reason: "SYNC_FROM_ROBLOX",
+            purchaseId: purchase.id
           }
         });
 
@@ -651,13 +680,37 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
         });
       }
 
-      // Create new license
+      // Check if user has already used this gamepass to claim a license (one-time per gamepass)
+      const existingPurchase = await prisma.purchase.findUnique({
+        where: {
+          buyerUserId_licenseTypeId: {
+            buyerUserId: userId,
+            licenseTypeId: purchaseSource.licenseTypeId
+          }
+        }
+      });
+
+      if (existingPurchase) {
+        return reply.status(409).send({ error: "You have already claimed a license from this gamepass. Each gamepass grants only one license." });
+      }
+
+      // Create purchase record (one-time per gamepass per user)
+      const purchase = await prisma.purchase.create({
+        data: {
+          robloxReceiptId: `claim_${userId}_${purchaseSource.licenseTypeId}_${Date.now()}`,
+          buyerUserId: userId,
+          licenseTypeId: purchaseSource.licenseTypeId
+        }
+      });
+
+      // Create new license linked to purchase
       const license = await prisma.license.create({
         data: {
           licenseTypeId: purchaseSource.licenseTypeId,
           ownerUserId: userId,
           status: LicenseStatus.ACTIVE,
-          origin: LicenseOrigin.PURCHASE
+          origin: LicenseOrigin.PURCHASE,
+          createdFromPurchaseId: purchase.id
         },
         include: {
           licenseType: true
@@ -669,7 +722,8 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
         data: {
           licenseId: license.id,
           toUserId: userId,
-          reason: "GAMEPASS_CLAIM"
+          reason: "GAMEPASS_CLAIM",
+          purchaseId: purchase.id
         }
       });
 
