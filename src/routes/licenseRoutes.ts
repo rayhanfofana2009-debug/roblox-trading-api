@@ -501,6 +501,8 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
 
     const { universeId } = parsedBody.data;
 
+    request.log.info("SYNC START");
+
     try {
       // Get all registered gamepasses from database for this universe
       const purchaseSources = await prisma.purchaseSource.findMany({
@@ -512,11 +514,13 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
         }
       });
 
+      request.log.info("Purchase sources loaded");
       request.log.info(`Found ${purchaseSources.length} purchase sources in database for universe ${universeId}`);
 
       // Get gamepasses user owns on Roblox
       const ownedGamepasses = await getUserGamepasses(userId, universeId);
 
+      request.log.info("Roblox API finished");
       request.log.info(`User ${userId} owns ${ownedGamepasses.length} gamepasses on Roblox: ${ownedGamepasses.map(id => id.toString()).join(', ')}`);
 
       // Get existing licenses for user
@@ -529,6 +533,7 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
         }
       });
 
+      request.log.info("Existing licenses loaded");
       request.log.info(`User ${userId} has ${existingLicenses.length} existing licenses in database`);
 
       const existingLicenseTypeIds = new Set(existingLicenses.map(l => l.licenseTypeId));
@@ -611,6 +616,8 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
           displayName: license.licenseType.displayName
         });
       }
+
+      request.log.info("SYNC COMPLETE");
 
       return reply.send({
         data: {
