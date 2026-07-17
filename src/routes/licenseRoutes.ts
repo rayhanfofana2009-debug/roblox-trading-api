@@ -519,6 +519,9 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
           ownerUserId: userId,
           licenseTypeId: purchaseSource.licenseTypeId,
           status: LicenseStatus.ACTIVE
+        },
+        include: {
+          licenseType: true
         }
       });
 
