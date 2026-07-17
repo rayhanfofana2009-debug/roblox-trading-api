@@ -2,7 +2,6 @@ import { FastifyInstance } from "fastify";
 import { prisma } from "../db.js";
 import { z } from "zod";
 import { LicenseOrigin, LicenseStatus, TradeSide, TradeStatus } from "@prisma/client";
-import { getUserGamepasses } from "../services/robloxApi.js";
 
 const playerParams = z.object({
   userId: z.coerce.bigint()
@@ -482,160 +481,6 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
     });
   });
 
-  app.post("/v1/players/:userId/sync-licenses", async (request, reply) => {
-    const parsedParams = playerParams.safeParse(request.params);
-    if (!parsedParams.success) {
-      return reply.badRequest("Invalid user id.");
-    }
-
-    const { userId } = parsedParams.data;
-
-    const syncBody = z.object({
-      universeId: z.coerce.bigint()
-    });
-
-    const parsedBody = syncBody.safeParse(request.body);
-    if (!parsedBody.success) {
-      return reply.badRequest("Invalid request body. universeId is required.");
-    }
-
-    const { universeId } = parsedBody.data;
-
-    request.log.info("SYNC START");
-
-    try {
-      // Get all registered gamepasses from database for this universe
-      const purchaseSources = await prisma.purchaseSource.findMany({
-        where: {
-          universeId: universeId
-        },
-        include: {
-          licenseType: true
-        }
-      });
-
-      request.log.info("Purchase sources loaded");
-      request.log.info(`Found ${purchaseSources.length} purchase sources in database for universe ${universeId}`);
-
-      // Get gamepasses user owns on Roblox
-      const ownedGamepasses = await getUserGamepasses(userId, universeId);
-
-      request.log.info("Roblox API finished");
-      request.log.info(`User ${userId} owns ${ownedGamepasses.length} gamepasses on Roblox: ${ownedGamepasses.map(id => id.toString()).join(', ')}`);
-
-      // Get existing licenses for user
-      const existingLicenses = await prisma.license.findMany({
-        where: {
-          ownerUserId: userId
-        },
-        select: {
-          licenseTypeId: true
-        }
-      });
-
-      request.log.info("Existing licenses loaded");
-      request.log.info(`User ${userId} has ${existingLicenses.length} existing licenses in database`);
-
-      const existingLicenseTypeIds = new Set(existingLicenses.map(l => l.licenseTypeId));
-      const createdLicenses = [];
-
-      // Check for existing purchases (one license per gamepass lifetime)
-      const existingPurchases = await prisma.purchase.findMany({
-        where: {
-          buyerUserId: userId
-        },
-        select: {
-          licenseTypeId: true
-        }
-      });
-
-      const purchasedLicenseTypeIds = new Set(existingPurchases.map(p => p.licenseTypeId));
-
-      // Create missing licenses for owned gamepasses
-      for (const source of purchaseSources) {
-        request.log.info(`Checking gamepass ${source.gamepassId} -> license type ${source.licenseTypeId}`);
-
-        // Check if user owns this gamepass on Roblox
-        if (!ownedGamepasses.includes(source.gamepassId)) {
-          request.log.info(`User does not own gamepass ${source.gamepassId} on Roblox`);
-          continue;
-        }
-
-        request.log.info(`User owns gamepass ${source.gamepassId} on Roblox`);
-
-        // Check if license already exists in database
-        if (existingLicenseTypeIds.has(source.licenseTypeId)) {
-          request.log.info(`License already exists for type ${source.licenseTypeId}`);
-          continue;
-        }
-
-        // Check if user has already used this gamepass to claim a license (one-time per gamepass)
-        if (purchasedLicenseTypeIds.has(source.licenseTypeId)) {
-          request.log.info(`User already claimed license from this gamepass type ${source.licenseTypeId} (one-time use)`);
-          continue;
-        }
-
-        request.log.info(`Creating license for type ${source.licenseTypeId}`);
-
-        // Create purchase record (one-time per gamepass per user)
-        const purchase = await prisma.purchase.create({
-          data: {
-            robloxReceiptId: `sync_${userId}_${source.licenseTypeId}_${Date.now()}`,
-            buyerUserId: userId,
-            licenseTypeId: source.licenseTypeId
-          }
-        });
-
-        // Create license linked to purchase
-        const license = await prisma.license.create({
-          data: {
-            licenseTypeId: source.licenseTypeId,
-            ownerUserId: userId,
-            status: LicenseStatus.ACTIVE,
-            origin: LicenseOrigin.PURCHASE,
-            createdFromPurchaseId: purchase.id
-          },
-          include: {
-            licenseType: true
-          }
-        });
-
-        // Create ownership event
-        await prisma.ownershipEvent.create({
-          data: {
-            licenseId: license.id,
-            toUserId: userId,
-            reason: "SYNC_FROM_ROBLOX",
-            purchaseId: purchase.id
-          }
-        });
-
-        createdLicenses.push({
-          licenseId: license.id,
-          licenseTypeId: license.licenseTypeId,
-          displayName: license.licenseType.displayName
-        });
-      }
-
-      request.log.info("SYNC COMPLETE");
-
-      return reply.send({
-        data: {
-          userId: userId.toString(),
-          universeId: universeId.toString(),
-          createdCount: createdLicenses.length,
-          createdLicenses
-        }
-      });
-    } catch (error) {
-      request.log.error(error);
-      if (error instanceof Error) {
-        return reply.internalServerError(error.message);
-      }
-      throw error;
-    }
-  });
-
   app.post("/v1/license/claim", async (request, reply) => {
     const parsedBody = claimBody.safeParse(request.body);
     if (!parsedBody.success) {
@@ -682,26 +527,14 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
           data: {
             success: true,
             alreadyClaimed: true,
-            licenseId: existingLicense.id
+            licenseId: existingLicense.id,
+            licenseTypeId: existingLicense.licenseTypeId,
+            displayName: existingLicense.licenseType?.displayName
           }
         });
       }
 
-      // Check if user has already used this gamepass to claim a license (one-time per gamepass)
-      const existingPurchase = await prisma.purchase.findUnique({
-        where: {
-          buyerUserId_licenseTypeId: {
-            buyerUserId: userId,
-            licenseTypeId: purchaseSource.licenseTypeId
-          }
-        }
-      });
-
-      if (existingPurchase) {
-        return reply.status(409).send({ error: "You have already claimed a license from this gamepass. Each gamepass grants only one license." });
-      }
-
-      // Create purchase record (one-time per gamepass per user)
+      // Create purchase record (historical record only - does not prevent future claims)
       const purchase = await prisma.purchase.create({
         data: {
           robloxReceiptId: `claim_${userId}_${purchaseSource.licenseTypeId}_${Date.now()}`,
