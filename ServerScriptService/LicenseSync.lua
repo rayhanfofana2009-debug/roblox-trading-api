@@ -135,8 +135,12 @@ local function makeRequest(method, endpoint, data, headers, validator)
 						print(k, v, typeof(v))
 					end
 				end
+				local logData = table.clone(requestData)
+				if logData.secret then
+					logData.secret = "********"
+				end
 				print("JSON:")
-				print(HttpService:JSONEncode(requestData))
+				print(HttpService:JSONEncode(logData))
 				options.Body = HttpService:JSONEncode(requestData)
 			end
 			return HttpService:RequestAsync(options)
