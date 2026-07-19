@@ -114,7 +114,11 @@ local function makeRequest(method, endpoint, data, headers, validator)
 		print("REQUEST:", method, url)
 		print("HEADERS:")
 		for k, v in pairs(requestHeaders) do
-			print(k, v)
+			if k:lower() == "authorization" then
+				print(k, "Bearer ********")
+			else
+				print(k, v)
+			end
 		end
 		local success, response = pcall(function()
 			local options = {
@@ -125,7 +129,11 @@ local function makeRequest(method, endpoint, data, headers, validator)
 			if method ~= "GET" then
 				print("BODY TABLE:")
 				for k,v in pairs(requestData) do
-					print(k, v, typeof(v))
+					if k:lower() == "secret" then
+						print(k, "********")
+					else
+						print(k, v, typeof(v))
+					end
 				end
 				print("JSON:")
 				print(HttpService:JSONEncode(requestData))
