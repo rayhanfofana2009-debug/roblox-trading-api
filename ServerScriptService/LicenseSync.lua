@@ -109,7 +109,6 @@ local function makeRequest(method, endpoint, data, headers, validator)
 	end
 
 	local lastError
-	local lastStatusCode
 	for attempt = 1, MAX_RETRIES + 1 do
 		print("REQUEST:", method, url)
 		print("HEADERS:")
@@ -227,10 +226,15 @@ local function scheduleBackgroundRetry(player, retryCount)
 		print("Background retry for " .. player.Name .. " (attempt " .. tostring(retryCount or 1) .. ")")
 		
 		-- Check gamepass ownership
-		local ownsGamepass = pcall(function()
+		local success, ownsGamepass = pcall(function()
 			return MarketplaceService:UserOwnsGamePassAsync(player.UserId, GAMEPASS_ID)
 		end)
-		
+
+		if not success then
+			warn("Ownership check failed")
+			return
+		end
+
 		if not ownsGamepass then
 			print("Player does not own gamepass, skipping claim")
 			return
