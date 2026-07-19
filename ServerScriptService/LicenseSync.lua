@@ -96,7 +96,7 @@ local function makeRequest(method, endpoint, data, headers, validator)
 	local url = API_BASE_URL .. endpoint
 	local requestData = data and table.clone(data) or {}
 
-	if requestData.userId then
+	if url:find(":userId") and requestData.userId then
 		url = url:gsub(":userId", HttpService:UrlEncode(tostring(requestData.userId)))
 		requestData.userId = nil
 	end
@@ -123,6 +123,12 @@ local function makeRequest(method, endpoint, data, headers, validator)
 				Headers = requestHeaders,
 			}
 			if method ~= "GET" then
+				print("BODY TABLE:")
+				for k,v in pairs(requestData) do
+					print(k, v, typeof(v))
+				end
+				print("JSON:")
+				print(HttpService:JSONEncode(requestData))
 				options.Body = HttpService:JSONEncode(requestData)
 			end
 			return HttpService:RequestAsync(options)
