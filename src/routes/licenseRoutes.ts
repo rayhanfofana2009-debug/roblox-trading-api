@@ -32,10 +32,10 @@ const tradeHistoryQuery = z.object({
 });
 
 const claimBody = z.object({
-  userId: z.coerce.bigint(),
-  gamepassId: z.coerce.bigint(),
-  universeId: z.coerce.bigint(),
-  secret: z.string()
+    userId: z.number().int(),
+    gamepassId: z.number().int(),
+    universeId: z.number().int(),
+    secret: z.string()
 });
 
 const executeTradeBody = z.object({
@@ -482,9 +482,19 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
   });
 
   app.post("/v1/license/claim", async (request, reply) => {
+    request.log.info({
+      rawBody: request.body
+    }, "Incoming claim request");
+
     const parsedBody = claimBody.safeParse(request.body);
     if (!parsedBody.success) {
-      return reply.badRequest("Invalid request body.");
+      request.log.error({
+        errors: parsedBody.error.flatten()
+      }, "Claim validation failed");
+
+      return reply.status(400).send({
+        error: parsedBody.error.flatten()
+      });
     }
 
     const { userId, gamepassId, universeId, secret } = parsedBody.data;
