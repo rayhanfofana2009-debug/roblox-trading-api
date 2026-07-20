@@ -54,9 +54,46 @@ local FONTS = {
 }
 
 -- ============================================================
--- STATE
+-- STATE MACHINE
 -- ============================================================
+local TradeState = {
+	Idle = "Idle",
+	SelectingPlayer = "SelectingPlayer",
+	WaitingForRequestResponse = "WaitingForRequestResponse",
+	IncomingRequest = "IncomingRequest",
+	LoadingInventory = "LoadingInventory",
+	Trading = "Trading",
+	Ready = "Ready",
+	Confirming = "Confirming",
+	Completed = "Completed",
+	Cancelled = "Cancelled",
+}
+
+-- Valid state transitions
+local STATE_TRANSITIONS = {
+	[TradeState.Idle] = {TradeState.SelectingPlayer, TradeState.IncomingRequest, TradeState.LoadingInventory},
+	[TradeState.SelectingPlayer] = {TradeState.Idle, TradeState.WaitingForRequestResponse},
+	[TradeState.WaitingForRequestResponse] = {TradeState.Idle, TradeState.Trading},
+	[TradeState.IncomingRequest] = {TradeState.Idle, TradeState.Trading},
+	[TradeState.LoadingInventory] = {TradeState.Idle, TradeState.Trading},
+	[TradeState.Trading] = {TradeState.Ready, TradeState.Cancelled},
+	[TradeState.Ready] = {TradeState.Trading, TradeState.Confirming, TradeState.Cancelled},
+	[TradeState.Confirming] = {TradeState.Completed, TradeState.Cancelled},
+	[TradeState.Completed] = {TradeState.Idle},
+	[TradeState.Cancelled] = {TradeState.Idle},
+}
+
+local function canTransition(fromState, toState)
+	local validTransitions = STATE_TRANSITIONS[fromState]
+	if not validTransitions then return false end
+	for _, validState in ipairs(validTransitions) do
+		if validState == toState then return true end
+	end
+	return false
+end
+
 local state = {
+	currentState = TradeState.Idle,
 	currentTradeId = nil,
 	partnerName = nil,
 	partnerId = nil,
@@ -88,6 +125,15 @@ local state = {
 	},
 }
 
+local function setState(newState)
+	if not canTransition(state.currentState, newState) then
+		warn("[TradeClient] Invalid state transition: " .. state.currentState .. " -> " .. newState)
+		return false
+	end
+	state.currentState = newState
+	return true
+end
+
 local LICENSE_MAX_RETRIES = 3
 local LICENSE_RETRY_DELAYS = {6, 12, 20}
 local currentFetchRequestId = nil
@@ -97,6 +143,9 @@ local BUTTON_DEBOUNCE_TIME = 0.5 -- seconds
 -- Connection management: separate permanent from temporary
 local permanentConnections = {} -- RemoteEvent listeners, PlayerAdded/Removing, global input
 local temporaryConnections = {} -- UI button connections (player list, inventory, offers)
+
+-- Animation cleanup tracking
+local activeAnimations = {} -- Track all active RenderStepped connections and Tweens
 
 -- ============================================================
 -- UI HELPERS
@@ -179,6 +228,29 @@ local function disconnectTemporaryConnections()
 	temporaryConnections = {}
 end
 
+local function cleanupAllAnimations()
+	for _, anim in ipairs(activeAnimations) do
+		if type(anim) == "table" then
+			if anim.connection then
+				anim.connection:Disconnect()
+			end
+			if anim.tween then
+				anim.tween:Cancel()
+			end
+		elseif typeof(anim) == "RBXScriptConnection" then
+			anim:Disconnect()
+		elseif typeof(anim) == "Tween" then
+			anim:Cancel()
+		end
+	end
+	activeAnimations = {}
+end
+
+local function trackAnimation(animation)
+	table.insert(activeAnimations, animation)
+	return #activeAnimations
+end
+
 -- ============================================================
 -- LOADING SPINNER
 -- ============================================================
@@ -224,6 +296,7 @@ local function createLoadingSpinner(parent)
 
 	local dots = {dot1, dot2, dot3, dot4}
 	local animationConn = nil
+	local animationId = nil
 
 	local function animate()
 		local time = 0
@@ -236,12 +309,22 @@ local function createLoadingSpinner(parent)
 				dot.Size = UDim2.new(0, 8 * (0.7 + 0.3 * alpha), 0, 8 * (0.7 + 0.3 * alpha))
 			end
 		end)
+		animationId = trackAnimation({connection = animationConn})
 	end
 
 	local function stop()
 		if animationConn then
 			animationConn:Disconnect()
 			animationConn = nil
+		end
+		if animationId then
+			-- Remove from activeAnimations
+			for i, anim in ipairs(activeAnimations) do
+				if type(anim) == "table" and anim.connection == animationConn then
+					table.remove(activeAnimations, i)
+					break
+				end
+			end
 		end
 	end
 
@@ -647,9 +730,11 @@ local function processToastQueue()
 		toastFrame.BackgroundTransparency = 1
 		local fadeIn = TweenService:Create(toastFrame, TweenInfo.new(0.3), {BackgroundTransparency = 0})
 		fadeIn:Play()
+		trackAnimation({tween = fadeIn})
 		task.wait(3)
 		local fadeOut = TweenService:Create(toastFrame, TweenInfo.new(0.3), {BackgroundTransparency = 1})
 		fadeOut:Play()
+		trackAnimation({tween = fadeOut})
 		fadeOut.Completed:Wait()
 		toastFrame.Visible = false
 		task.wait(0.1)
@@ -1111,7 +1196,8 @@ local function resetTradeUI()
 		currentRetryTask = nil
 	end
 
-	-- Clear all UI elements and temporary connections
+	-- Cleanup all animations and temporary connections
+	cleanupAllAnimations()
 	disconnectTemporaryConnections()
 	clearChildren(myOfferScroll, "Frame")
 	clearChildren(theirOfferScroll, "Frame")
@@ -1120,6 +1206,9 @@ local function resetTradeUI()
 	-- Re-enable buttons
 	setAllButtonsEnabled(true)
 	resetButtonStates()
+	
+	-- Reset state to Idle
+	setState(TradeState.Idle)
 end
 
 -- ============================================================
@@ -1138,6 +1227,7 @@ local function fetchLicenses()
 	currentFetchRequestId = requestId
 	state.licensesStatus = "loading"
 	state.licensesRetryCount = 0
+	setState(TradeState.LoadingInventory)
 	refreshInventory()
 	GetPlayerLicensesRE:FireServer(requestId)
 end
@@ -1153,7 +1243,10 @@ local tradeButtonConn = tradeButton.MouseButton1Click:Connect(function()
 	else
 		playerListFrame.Visible = not playerListFrame.Visible
 		if playerListFrame.Visible then
+			setState(TradeState.SelectingPlayer)
 			refreshPlayerList()
+		else
+			setState(TradeState.Idle)
 		end
 	end
 end)
@@ -1167,7 +1260,10 @@ local inputBeganConn = UserInputService.InputBegan:Connect(function(input, gameP
 		else
 			playerListFrame.Visible = not playerListFrame.Visible
 			if playerListFrame.Visible then
+				setState(TradeState.SelectingPlayer)
 				refreshPlayerList()
+			else
+				setState(TradeState.Idle)
 			end
 		end
 	end
@@ -1176,6 +1272,7 @@ table.insert(permanentConnections, inputBeganConn)
 
 local playerListCloseConn = playerListClose.MouseButton1Click:Connect(function()
 	playerListFrame.Visible = false
+	setState(TradeState.Idle)
 end)
 table.insert(permanentConnections, playerListCloseConn)
 
@@ -1195,6 +1292,7 @@ local acceptBtnConn = acceptBtn.MouseButton1Click:Connect(function()
 			requestTimerConn:Disconnect()
 			requestTimerConn = nil
 		end
+		setState(TradeState.Trading)
 	end
 end)
 table.insert(permanentConnections, acceptBtnConn)
@@ -1212,6 +1310,7 @@ local declineBtnConn = declineBtn.MouseButton1Click:Connect(function()
 			requestTimerConn:Disconnect()
 			requestTimerConn = nil
 		end
+		setState(TradeState.Idle)
 	end
 end)
 table.insert(permanentConnections, declineBtnConn)
@@ -1293,6 +1392,12 @@ table.insert(permanentConnections, successCloseBtnConn)
 
 -- Incoming trade request (Phase 2)
 SendTradeRequestRE.OnClientEvent:Connect(function(data)
+	-- Validate data structure
+	if not data or not data.requestId or not data.requesterName then
+		warn("[TradeClient] Invalid trade request data")
+		return
+	end
+	
 	if state.currentTradeId then
 		TradeRequestResponseRE:FireServer({
 			accepted = false,
@@ -1304,6 +1409,7 @@ SendTradeRequestRE.OnClientEvent:Connect(function(data)
 	currentRequestId = data.requestId
 	requestNameLabel.Text = data.requesterName .. " wants to trade!"
 	requestPopupFrame.Visible = true
+	setState(TradeState.IncomingRequest)
 
 	-- Timer animation (30s)
 	if requestTimerConn then
@@ -1321,32 +1427,56 @@ SendTradeRequestRE.OnClientEvent:Connect(function(data)
 				requestTimerConn:Disconnect()
 				requestTimerConn = nil
 			end
+			-- Auto-decline on timeout
+			if currentRequestId then
+				TradeRequestResponseRE:FireServer({
+					accepted = false,
+					requestId = currentRequestId,
+				})
+				currentRequestId = nil
+				requestPopupFrame.Visible = false
+				setState(TradeState.Idle)
+			end
 			return
 		end
 		requestTimerBar.Size = UDim2.new(0.8 * remaining, 0, 0, 4)
 		requestTimerBar.BackgroundColor3 = remaining < 0.3 and COLORS.red or COLORS.accent
 	end)
+	trackAnimation({connection = requestTimerConn})
 end)
 
 -- Trade request response (for the requester)
 TradeRequestResponseRE.OnClientEvent:Connect(function(data)
+	-- Validate data structure
+	if not data or type(data.accepted) ~= "boolean" then
+		warn("[TradeClient] Invalid trade request response data")
+		return
+	end
+	
 	if data.accepted then
-		showToast(data.targetName .. " accepted your trade request!")
+		showToast((data.targetName or "Player") .. " accepted your trade request!")
 	else
 		local reasons = {
-			declined = data.targetName .. " declined your trade request",
-			expired = "Trade request to " .. data.targetName .. " expired",
-			busy = data.targetName .. " is already in a trade",
+			declined = (data.targetName or "Player") .. " declined your trade request",
+			expired = "Trade request to " .. (data.targetName or "Player") .. " expired",
+			busy = (data.targetName or "Player") .. " is already in a trade",
 			already_in_trade = "You are already in a trade",
-			target_in_trade = data.targetName .. " is already in a trade",
-			superseded = "Your request to " .. data.targetName .. " was superseded",
+			target_in_trade = (data.targetName or "Player") .. " is already in a trade",
+			superseded = "Your request to " .. (data.targetName or "Player") .. " was superseded",
 		}
 		showToast(reasons[data.reason] or "Trade request failed")
+		setState(TradeState.Idle)
 	end
 end)
 
 -- Trade started (Phase 3)
 TradeStartedRE.OnClientEvent:Connect(function(data)
+	-- Validate data structure
+	if not data or not data.tradeId or not data.partnerName or not data.partnerId then
+		warn("[TradeClient] Invalid trade started data")
+		return
+	end
+	
 	state.currentTradeId = data.tradeId
 	state.partnerName = data.partnerName
 	state.partnerId = data.partnerId
@@ -1361,15 +1491,26 @@ TradeStartedRE.OnClientEvent:Connect(function(data)
 	confirmBtn.Visible = false
 	warningLabel.Visible = false
 
+	setState(TradeState.Trading)
 	fetchLicenses()
 end)
 
 -- Trade update (state changes, Phase 5-6)
 TradeUpdateRE.OnClientEvent:Connect(function(data)
+	-- Validate data structure
+	if not data or not data.tradeId then
+		warn("[TradeClient] Invalid trade update data")
+		return
+	end
+	
+	-- Ignore stale packets
+	if data.tradeId ~= state.currentTradeId then return end
+	
 	-- Completion event (Phase 7)
 	if data.action == "Completed" then
 		showSuccess(data.receivedLicenses or {})
 		state.currentTradeId = nil
+		setState(TradeState.Completed)
 		
 		-- Auto-refresh licenses after trade completion
 		task.delay(0.5, function()
@@ -1380,8 +1521,6 @@ TradeUpdateRE.OnClientEvent:Connect(function(data)
 	end
 
 	-- Regular trade state update
-	if data.tradeId ~= state.currentTradeId then return end
-
 	refreshOffers(data)
 	updateStatus(data)
 	refreshInventory()
@@ -1389,6 +1528,17 @@ end)
 
 -- Trade cancelled
 TradeCancelledRE.OnClientEvent:Connect(function(data)
+	-- Validate data structure
+	if not data then
+		warn("[TradeClient] Invalid trade cancelled data")
+		return
+	end
+	
+	-- Ignore stale packets
+	if data.tradeId and data.tradeId ~= state.currentTradeId then
+		return
+	end
+	
 	-- Handle disconnects with friendly messages
 	if data.reason == "player_left" then
 		showToast("Trade cancelled.")
@@ -1403,13 +1553,14 @@ TradeCancelledRE.OnClientEvent:Connect(function(data)
 		showToast("Trade ended: " .. tostring(data.reason))
 	end
 	
+	setState(TradeState.Cancelled)
 	resetTradeUI()
 end)
 
 -- Get player licenses response
 GetPlayerLicensesRE.OnClientEvent:Connect(function(requestId, data)
-	-- Ignore stale responses from previous fetch attempts
-	if requestId ~= currentFetchRequestId then return end
+	-- Validate request ID to ignore stale responses
+	if not requestId or requestId ~= currentFetchRequestId then return end
 	currentFetchRequestId = nil
 
 	if data and data.success and data.data then
@@ -1417,6 +1568,9 @@ GetPlayerLicensesRE.OnClientEvent:Connect(function(requestId, data)
 		state.licensesRetryCount = 0
 		state.licensesStatus = "idle"
 		state.buttonStates.retryLicenses = false
+		if state.currentState == TradeState.LoadingInventory then
+			setState(TradeState.Idle)
+		end
 		refreshInventory()
 	elseif state.licensesRetryCount < LICENSE_MAX_RETRIES then
 		state.licensesRetryCount += 1
@@ -1437,6 +1591,9 @@ GetPlayerLicensesRE.OnClientEvent:Connect(function(requestId, data)
 		state.licensesStatus = "error"
 		state.buttonStates.retryLicenses = false
 		showToast("Failed to load licenses after " .. LICENSE_MAX_RETRIES .. " attempts.")
+		if state.currentState == TradeState.LoadingInventory then
+			setState(TradeState.Idle)
+		end
 		refreshInventory()
 	end
 end)
@@ -1462,4 +1619,4 @@ table.insert(permanentConnections, playerRemovingConn)
 -- INITIAL LOAD
 -- ============================================================
 fetchLicenses()
-print("[TradeClient] Loaded with refactoring: connection cleanup, incremental player list, retry task cancellation, simplified debounce system")
+print("[TradeClient] Production-ready: State machine, animation cleanup, network validation, stale packet prevention")
