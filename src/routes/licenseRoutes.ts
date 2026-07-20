@@ -32,9 +32,9 @@ const tradeHistoryQuery = z.object({
 });
 
 const claimBody = z.object({
-    userId: z.number().int(),
-    gamepassId: z.number().int(),
-    universeId: z.number().int(),
+    userId: z.coerce.bigint(),
+    gamepassId: z.coerce.bigint(),
+    universeId: z.coerce.bigint(),
     secret: z.string()
 });
 
