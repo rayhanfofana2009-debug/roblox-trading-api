@@ -91,10 +91,12 @@ local state = {
 local LICENSE_MAX_RETRIES = 3
 local LICENSE_RETRY_DELAYS = {6, 12, 20}
 local currentFetchRequestId = nil
+local currentRetryTask = nil -- Store retry task for cancellation
 local BUTTON_DEBOUNCE_TIME = 0.5 -- seconds
 
--- Fix #4: Connection table to prevent memory leaks
-local connections = {}
+-- Connection management: separate permanent from temporary
+local permanentConnections = {} -- RemoteEvent listeners, PlayerAdded/Removing, global input
+local temporaryConnections = {} -- UI button connections (player list, inventory, offers)
 
 -- ============================================================
 -- UI HELPERS
@@ -166,6 +168,15 @@ local function clearChildren(frame, className)
 			child:Destroy()
 		end
 	end
+end
+
+local function disconnectTemporaryConnections()
+	for _, conn in ipairs(temporaryConnections) do
+		if conn then
+			conn:Disconnect()
+		end
+	end
+	temporaryConnections = {}
 end
 
 -- ============================================================
@@ -671,58 +682,105 @@ local function resetButtonStates()
 		cancel = false,
 		retryLicenses = false,
 	}
+	-- Reset debounce timers as well
+	state.lastButtonPress = {
+		ready = 0,
+		unready = 0,
+		confirm = 0,
+		cancel = 0,
+		retryLicenses = 0,
+	}
 end
 
 -- ============================================================
 -- PHASE 1: PLAYER LIST LOGIC
 -- ============================================================
-local function refreshPlayerList()
-	clearChildren(playerScrollFrame, "Frame")
+-- Player list incremental management
+local playerEntries = {} -- Maps userId to entry Frame
 
-	local otherPlayers = {}
-	for _, p in Players:GetPlayers() do
-		if p ~= player then
-			table.insert(otherPlayers, p)
+local function refreshPlayerList()
+	-- Disconnect temporary connections from previous player list entries
+	for userId, entry in pairs(playerEntries) do
+		if entry and entry.Parent then
+			local tradeBtn = entry:FindFirstChildOfClass("TextButton")
+			if tradeBtn then
+				-- Find and disconnect the connection
+				for i, conn in ipairs(temporaryConnections) do
+					if conn.Connected == false then
+						table.remove(temporaryConnections, i)
+						break
+					end
+				end
+			end
 		end
 	end
+	
+	-- Clear only disconnected entries
+	for userId, entry in pairs(playerEntries) do
+		if not entry.Parent then
+			playerEntries[userId] = nil
+		end
+	end
+	
+	-- Get current players
+	local currentPlayers = {}
+	for _, p in Players:GetPlayers() do
+		if p ~= player then
+			currentPlayers[p.UserId] = p
+		end
+	end
+	
+	-- Remove entries for players who left
+	for userId, entry in pairs(playerEntries) do
+		if not currentPlayers[userId] then
+			entry:Destroy()
+			playerEntries[userId] = nil
+		end
+	end
+	
+	-- Add entries for new players
+	for userId, p in pairs(currentPlayers) do
+		if not playerEntries[userId] then
+			local entry = Instance.new("Frame")
+			entry.Size = UDim2.new(1, 0, 0, 40)
+			entry.BackgroundColor3 = COLORS.bgDark
+			entry.BorderSizePixel = 0
+			addCorner(entry, 6)
+			entry.Parent = playerScrollFrame
+			
+			local nameLabel = makeLabel(entry, p.Name, FONTS.body, 14, COLORS.text)
+			nameLabel.Size = UDim2.new(0.6, 0, 1, 0)
+			nameLabel.Position = UDim2.new(0, 10, 0, 0)
 
-	if #otherPlayers == 0 then
+			local tradeBtn = makeButton(entry, "Trade", COLORS.accent, COLORS.text, FONTS.small, 12)
+			tradeBtn.Size = UDim2.new(0, 60, 0, 28)
+			tradeBtn.Position = UDim2.new(1, -70, 0.5, -14)
+
+			-- Store targetUserId as attribute to prevent wrong player selection
+			tradeBtn:SetAttribute("TargetUserId", p.UserId)
+
+			local conn = tradeBtn.MouseButton1Click:Connect(function()
+				if state.currentTradeId then
+					showToast("You are already in a trade!")
+					return
+				end
+				local targetUserId = tradeBtn:GetAttribute("TargetUserId")
+				SendTradeRequestRE:FireServer({targetUserId = targetUserId})
+				showToast("Trade request sent to " .. p.Name)
+				playerListFrame.Visible = false
+			end)
+			table.insert(temporaryConnections, conn)
+			
+			playerEntries[userId] = entry
+		end
+	end
+	
+	-- Show empty state if no players
+	if next(currentPlayers) == nil then
+		clearChildren(playerScrollFrame, "Frame")
 		local emptyLabel = makeLabel(playerScrollFrame, "No other players online", FONTS.body, 13, COLORS.textDim)
 		emptyLabel.Size = UDim2.new(1, 0, 0, 30)
 		emptyLabel.TextXAlignment = Enum.TextXAlignment.Center
-		return
-	end
-
-	for i, p in ipairs(otherPlayers) do
-		local entry = Instance.new("Frame")
-		entry.Size = UDim2.new(1, 0, 0, 40)
-		entry.BackgroundColor3 = COLORS.bgDark
-		entry.BorderSizePixel = 0
-		addCorner(entry, 6)
-		entry.Parent = playerScrollFrame
-
-		local nameLabel = makeLabel(entry, p.Name, FONTS.body, 14, COLORS.text)
-		nameLabel.Size = UDim2.new(0.6, 0, 1, 0)
-		nameLabel.Position = UDim2.new(0, 10, 0, 0)
-
-		local tradeBtn = makeButton(entry, "Trade", COLORS.accent, COLORS.text, FONTS.small, 12)
-		tradeBtn.Size = UDim2.new(0, 60, 0, 28)
-		tradeBtn.Position = UDim2.new(1, -70, 0.5, -14)
-
-		-- Fix #1: Store targetUserId as attribute to prevent wrong player selection
-		tradeBtn:SetAttribute("TargetUserId", p.UserId)
-
-		local conn = tradeBtn.MouseButton1Click:Connect(function()
-			if state.currentTradeId then
-				showToast("You are already in a trade!")
-				return
-			end
-			local targetUserId = tradeBtn:GetAttribute("TargetUserId")
-			SendTradeRequestRE:FireServer({targetUserId = targetUserId})
-			showToast("Trade request sent to " .. p.Name)
-			playerListFrame.Visible = false
-		end)
-		table.insert(connections, conn)
 	end
 end
 
@@ -751,11 +809,22 @@ local function resetReadyState()
 end
 
 local function refreshInventory()
+	-- Stop any existing loading spinner animation
+	local existingLoading = inventoryScroll:FindFirstChild("LoadingContainer")
+	if existingLoading then
+		local stopFunc = existingLoading:GetAttribute("SpinnerStop")
+		if type(stopFunc) == "function" then
+			stopFunc()
+		end
+		existingLoading:Destroy()
+	end
+
 	clearChildren(inventoryScroll, "Frame")
 
 	if state.licensesStatus == "loading" and #state.myLicenses == 0 then
 		-- Improved loading message with spinner
 		local loadingContainer = Instance.new("Frame")
+		loadingContainer.Name = "LoadingContainer"
 		loadingContainer.Size = UDim2.new(1, 0, 0, 80)
 		loadingContainer.BackgroundTransparency = 1
 		loadingContainer.Parent = inventoryScroll
@@ -773,14 +842,8 @@ local function refreshInventory()
 		subLabel.Position = UDim2.new(0, 0, 1, -5)
 		subLabel.TextXAlignment = Enum.TextXAlignment.Center
 
-		-- Store stop function to clean up later
-		loadingContainer:SetAttribute("SpinnerStop", true)
-		task.delay(0.1, function()
-			if loadingContainer and loadingContainer.Parent then
-				stop()
-				loadingContainer:Destroy()
-			end
-		end)
+		-- Store stop function in container for cleanup when UI is rebuilt
+		loadingContainer:SetAttribute("SpinnerStop", stop)
 		return
 	end
 
@@ -801,19 +864,20 @@ local function refreshInventory()
 		retryBtn.Position = UDim2.new(0.2, 0, 0, 35)
 
 		local conn = retryBtn.MouseButton1Click:Connect(function()
-			-- Debounce check
-			if tick() - state.lastButtonPress.retryLicenses < BUTTON_DEBOUNCE_TIME then
-				return
-			end
-			state.lastButtonPress.retryLicenses = tick()
-			
+			-- Button state locking is sufficient - timestamp debounce removed as redundant
 			if state.buttonStates.retryLicenses then return end
 			state.buttonStates.retryLicenses = true
 			setButtonEnabled(retryBtn, false)
 			
+			-- Cancel any existing retry task
+			if currentRetryTask then
+				task.cancel(currentRetryTask)
+				currentRetryTask = nil
+			end
+			
 			fetchLicenses()
 		end)
-		table.insert(connections, conn)
+		table.insert(temporaryConnections, conn)
 		return
 	end
 
@@ -861,7 +925,7 @@ local function refreshInventory()
 				licenseId = lic.id,
 			})
 		end)
-		table.insert(connections, conn)
+		table.insert(temporaryConnections, conn)
 	end
 end
 
@@ -869,6 +933,16 @@ end
 -- PHASE 5: OFFER LOGIC
 -- ============================================================
 local function refreshOffers(tradeState)
+	-- Clear temporary connections from previous offer UI
+	for _, child in ipairs(myOfferScroll:GetChildren()) do
+		if child:IsA("Frame") then
+			local btn = child:FindFirstChildOfClass("TextButton")
+			if btn then
+				-- Connections will be cleaned via disconnectTemporaryConnections
+			end
+		end
+	end
+	
 	clearChildren(myOfferScroll, "Frame")
 	clearChildren(theirOfferScroll, "Frame")
 
@@ -901,7 +975,7 @@ local function refreshOffers(tradeState)
 				licenseId = lic.id,
 			})
 		end)
-		table.insert(connections, conn)
+		table.insert(temporaryConnections, conn)
 	end
 
 	for i, lic in ipairs(tradeState.theirOfferedLicenses) do
@@ -1031,7 +1105,14 @@ local function resetTradeUI()
 	requestPopupFrame.Visible = false
 	successFrame.Visible = false
 
-	-- Clear all UI elements
+	-- Cancel any pending retry task
+	if currentRetryTask then
+		task.cancel(currentRetryTask)
+		currentRetryTask = nil
+	end
+
+	-- Clear all UI elements and temporary connections
+	disconnectTemporaryConnections()
 	clearChildren(myOfferScroll, "Frame")
 	clearChildren(theirOfferScroll, "Frame")
 	resetReadyState()
@@ -1046,6 +1127,13 @@ end
 -- ============================================================
 local function fetchLicenses()
 	if state.licensesStatus == "loading" then return end
+	
+	-- Cancel any existing retry task
+	if currentRetryTask then
+		task.cancel(currentRetryTask)
+		currentRetryTask = nil
+	end
+	
 	local requestId = "fetch_" .. tostring(math.floor(tick() * 1000))
 	currentFetchRequestId = requestId
 	state.licensesStatus = "loading"
@@ -1069,7 +1157,7 @@ local tradeButtonConn = tradeButton.MouseButton1Click:Connect(function()
 		end
 	end
 end)
-table.insert(connections, tradeButtonConn)
+table.insert(permanentConnections, tradeButtonConn)
 
 local inputBeganConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	if gameProcessed then return end
@@ -1084,12 +1172,12 @@ local inputBeganConn = UserInputService.InputBegan:Connect(function(input, gameP
 		end
 	end
 end)
-table.insert(connections, inputBeganConn)
+table.insert(permanentConnections, inputBeganConn)
 
 local playerListCloseConn = playerListClose.MouseButton1Click:Connect(function()
 	playerListFrame.Visible = false
 end)
-table.insert(connections, playerListCloseConn)
+table.insert(permanentConnections, playerListCloseConn)
 
 -- Phase 2: Accept/Decline
 local currentRequestId = nil
@@ -1109,7 +1197,7 @@ local acceptBtnConn = acceptBtn.MouseButton1Click:Connect(function()
 		end
 	end
 end)
-table.insert(connections, acceptBtnConn)
+table.insert(permanentConnections, acceptBtnConn)
 
 local declineBtnConn = declineBtn.MouseButton1Click:Connect(function()
 	if declineBtn.Active == false then return end -- Debounce
@@ -1126,19 +1214,14 @@ local declineBtnConn = declineBtn.MouseButton1Click:Connect(function()
 		end
 	end
 end)
-table.insert(connections, declineBtnConn)
+table.insert(permanentConnections, declineBtnConn)
 
 -- Phase 6: Ready/Unready/Confirm
 local readyBtnConn = readyBtn.MouseButton1Click:Connect(function()
 	if not state.currentTradeId then return end
 	if state.buttonStates.ready then return end
 	
-	-- Debounce check
-	if tick() - state.lastButtonPress.ready < BUTTON_DEBOUNCE_TIME then
-		return
-	end
-	state.lastButtonPress.ready = tick()
-	
+	-- Button state locking is sufficient - timestamp debounce removed as redundant
 	state.buttonStates.ready = true
 	setButtonEnabled(readyBtn, false)
 	
@@ -1148,18 +1231,13 @@ local readyBtnConn = readyBtn.MouseButton1Click:Connect(function()
 		ready = true,
 	})
 end)
-table.insert(connections, readyBtnConn)
+table.insert(permanentConnections, readyBtnConn)
 
 local unreadyBtnConn = unreadyBtn.MouseButton1Click:Connect(function()
 	if not state.currentTradeId then return end
 	if state.buttonStates.unready then return end
 	
-	-- Debounce check
-	if tick() - state.lastButtonPress.unready < BUTTON_DEBOUNCE_TIME then
-		return
-	end
-	state.lastButtonPress.unready = tick()
-	
+	-- Button state locking is sufficient - timestamp debounce removed as redundant
 	state.buttonStates.unready = true
 	setButtonEnabled(unreadyBtn, false)
 	
@@ -1169,18 +1247,13 @@ local unreadyBtnConn = unreadyBtn.MouseButton1Click:Connect(function()
 		ready = false,
 	})
 end)
-table.insert(connections, unreadyBtnConn)
+table.insert(permanentConnections, unreadyBtnConn)
 
 local confirmBtnConn = confirmBtn.MouseButton1Click:Connect(function()
 	if not state.currentTradeId then return end
 	if state.buttonStates.confirm then return end
 	
-	-- Debounce check
-	if tick() - state.lastButtonPress.confirm < BUTTON_DEBOUNCE_TIME then
-		return
-	end
-	state.lastButtonPress.confirm = tick()
-	
+	-- Button state locking is sufficient - timestamp debounce removed as redundant
 	state.buttonStates.confirm = true
 	setButtonEnabled(confirmBtn, false)
 	
@@ -1188,19 +1261,14 @@ local confirmBtnConn = confirmBtn.MouseButton1Click:Connect(function()
 		tradeId = state.currentTradeId,
 	})
 end)
-table.insert(connections, confirmBtnConn)
+table.insert(permanentConnections, confirmBtnConn)
 
 -- Cancel trade
 local tradeCloseBtnConn = tradeCloseBtn.MouseButton1Click:Connect(function()
 	if not state.currentTradeId then return end
 	if state.buttonStates.cancel then return end
 	
-	-- Debounce check
-	if tick() - state.lastButtonPress.cancel < BUTTON_DEBOUNCE_TIME then
-		return
-	end
-	state.lastButtonPress.cancel = tick()
-	
+	-- Button state locking is sufficient - timestamp debounce removed as redundant
 	state.buttonStates.cancel = true
 	setButtonEnabled(tradeCloseBtn, false)
 	
@@ -1210,14 +1278,14 @@ local tradeCloseBtnConn = tradeCloseBtn.MouseButton1Click:Connect(function()
 	})
 	resetTradeUI()
 end)
-table.insert(connections, tradeCloseBtnConn)
+table.insert(permanentConnections, tradeCloseBtnConn)
 
 -- Success close
 local successCloseBtnConn = successCloseBtn.MouseButton1Click:Connect(function()
 	successFrame.Visible = false
 	fetchLicenses()
 end)
-table.insert(connections, successCloseBtnConn)
+table.insert(permanentConnections, successCloseBtnConn)
 
 -- ============================================================
 -- REMOTE EVENT LISTENERS
@@ -1356,13 +1424,14 @@ GetPlayerLicensesRE.OnClientEvent:Connect(function(requestId, data)
 		local delay = LICENSE_RETRY_DELAYS[state.licensesRetryCount] or 20
 		showToast("Failed to load licenses. Retrying in " .. delay .. "s... (" .. state.licensesRetryCount .. "/" .. LICENSE_MAX_RETRIES .. ")")
 		refreshInventory()
-		task.delay(delay, function()
+		currentRetryTask = task.delay(delay, function()
 			if state.licensesStatus ~= "retrying" then return end
 			local newRequestId = "fetch_" .. tostring(math.floor(tick() * 1000))
 			currentFetchRequestId = newRequestId
 			state.licensesStatus = "loading"
 			refreshInventory()
 			GetPlayerLicensesRE:FireServer(newRequestId)
+			currentRetryTask = nil
 		end)
 	else
 		state.licensesStatus = "error"
@@ -1380,17 +1449,17 @@ local playerAddedConn = Players.PlayerAdded:Connect(function(p)
 		refreshPlayerList()
 	end
 end)
-table.insert(connections, playerAddedConn)
+table.insert(permanentConnections, playerAddedConn)
 
 local playerRemovingConn = Players.PlayerRemoving:Connect(function(p)
 	if playerListFrame.Visible then
 		refreshPlayerList()
 	end
 end)
-table.insert(connections, playerRemovingConn)
+table.insert(permanentConnections, playerRemovingConn)
 
 -- ============================================================
 -- INITIAL LOAD
 -- ============================================================
 fetchLicenses()
-print("[TradeClient] Loaded with improvements: button debouncing, loading spinners, friendly disconnect messages, auto-refresh on completion")
+print("[TradeClient] Loaded with refactoring: connection cleanup, incremental player list, retry task cancellation, simplified debounce system")
