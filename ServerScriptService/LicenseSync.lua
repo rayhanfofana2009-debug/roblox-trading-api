@@ -9,6 +9,8 @@
 --   local LicenseCache = require(game.ServerStorage.LicenseCache)
 --   LicenseCache.checkOwnership(userId, licenseId)  --> true/false/nil
 
+local DEBUG = false
+
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local MarketplaceService = game:GetService("MarketplaceService")
@@ -110,13 +112,15 @@ local function makeRequest(method, endpoint, data, headers, validator)
 
 	local lastError
 	for attempt = 1, MAX_RETRIES + 1 do
-		print("REQUEST:", method, url)
-		print("HEADERS:")
-		for k, v in pairs(requestHeaders) do
-			if k:lower() == "authorization" then
-				print(k, "Bearer ********")
-			else
-				print(k, v)
+		if DEBUG then
+			print("REQUEST:", method, url)
+			print("HEADERS:")
+			for k, v in pairs(requestHeaders) do
+				if k:lower() == "authorization" then
+					print(k, "Bearer ********")
+				else
+					print(k, v)
+				end
 			end
 		end
 		local success, response = pcall(function()
@@ -126,36 +130,39 @@ local function makeRequest(method, endpoint, data, headers, validator)
 				Headers = requestHeaders,
 			}
 			if method ~= "GET" then
-				print("BODY TABLE:")
-				for k,v in pairs(requestData) do
-					if k:lower() == "secret" then
-						print(k, "********")
-					else
-						print(k, v, typeof(v))
+				if DEBUG then
+					print("BODY TABLE:")
+					for k,v in pairs(requestData) do
+						if k:lower() == "secret" then
+							print(k, "********")
+						else
+							print(k, v, typeof(v))
+						end
 					end
+					local logData = table.clone(requestData)
+					if logData.secret then
+						logData.secret = "********"
+					end
+					print("JSON:")
+					print(HttpService:JSONEncode(logData))
 				end
-				local logData = table.clone(requestData)
-				if logData.secret then
-					logData.secret = "********"
-				end
-				print("JSON:")
-				print(HttpService:JSONEncode(logData))
 				options.Body = HttpService:JSONEncode(requestData)
 			end
 			return HttpService:RequestAsync(options)
 		end)
 
-		print("SUCCESS:", success)
-		if success then
-			print("STATUS:", response.StatusCode)
-		else
-			print("ERROR:", tostring(response))
+		if DEBUG then
+			print("SUCCESS:", success)
+			if success then
+				print("STATUS:", response.StatusCode)
+			else
+				print("ERROR:", tostring(response))
+			end
 		end
 
 		if not success then
 			local errorMsg = tostring(response)
 			lastError = isTimeoutError(errorMsg) and "Request timed out" or errorMsg
-			lastStatusCode = nil
 			if attempt <= MAX_RETRIES then
 				task.wait(2 ^ (attempt - 1))
 			end
@@ -174,7 +181,6 @@ local function makeRequest(method, endpoint, data, headers, validator)
 		else
 			local decodeOk, decoded = pcall(HttpService.JSONDecode, HttpService, response.Body)
 			lastError = (decodeOk and decoded and decoded.error) and decoded.error or tostring(response.StatusCode)
-			lastStatusCode = response.StatusCode
 			if not shouldRetry(response.StatusCode) then
 				return nil, lastError
 			end
@@ -281,15 +287,17 @@ local FETCH_RETRY_DELAYS = {5, 15, 30}  -- seconds between retries
 local function onPlayerAdded(player)
 	task.spawn(function()
 		-- Step 1: Check gamepass ownership
-		local ownsGamepass, ownershipErr = pcall(function()
+		local success, ownsGamepass = pcall(function()
 			return MarketplaceService:UserOwnsGamePassAsync(player.UserId, GAMEPASS_ID)
 		end)
-		
+
+		if not success then
+			warn("Ownership check failed")
+			return
+		end
+
 		if not ownsGamepass then
 			print("Player does not own gamepass " .. GAMEPASS_ID .. ", skipping license claim")
-			if ownershipErr then
-				warn("Ownership check error: " .. tostring(ownershipErr))
-			end
 			return
 		end
 		
