@@ -7,6 +7,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -129,16 +130,30 @@ local LICENSE_RETRY_DELAYS = {6, 12, 20}
 local currentFetchRequestId = nil
 local currentRetryTask = nil -- Store retry task for cancellation
 local BUTTON_DEBOUNCE_TIME = 0.5 -- seconds
+local SERVER_ACK_TIMEOUT = 5 -- seconds to wait for server response before re-enabling button
+
+-- Button timeout tasks for server acknowledgement
+local buttonTimeoutTasks = {
+	ready = nil,
+	unready = nil,
+	confirm = nil,
+	cancel = nil,
+}
 
 -- Connection management: separate permanent from temporary
 local permanentConnections = {} -- RemoteEvent listeners, PlayerAdded/Removing, global input
-local temporaryConnections = {} -- UI button connections (player list, inventory, offers)
+local playerListConnections = {} -- Player list button connections
+local inventoryConnections = {} -- Inventory add button connections
+local offerConnections = {} -- Offer remove button connections
 
 -- Animation cleanup tracking
 local activeAnimations = {} -- Track all active RenderStepped connections and Tweens
 
 -- Forward declare functions used in callbacks
 local fetchLicenses
+local disconnectPlayerListConnections
+local disconnectInventoryConnections
+local disconnectOfferConnections
 
 -- ============================================================
 -- UI HELPERS
@@ -212,13 +227,37 @@ local function clearChildren(frame, className)
 	end
 end
 
-local function disconnectTemporaryConnections()
-	for _, conn in ipairs(temporaryConnections) do
+local function disconnectPlayerListConnections()
+	for _, conn in ipairs(playerListConnections) do
 		if conn then
 			conn:Disconnect()
 		end
 	end
-	temporaryConnections = {}
+	playerListConnections = {}
+end
+
+local function disconnectInventoryConnections()
+	for _, conn in ipairs(inventoryConnections) do
+		if conn then
+			conn:Disconnect()
+		end
+	end
+	inventoryConnections = {}
+end
+
+local function disconnectOfferConnections()
+	for _, conn in ipairs(offerConnections) do
+		if conn then
+			conn:Disconnect()
+		end
+	end
+	offerConnections = {}
+end
+
+local function disconnectAllTemporaryConnections()
+	disconnectPlayerListConnections()
+	disconnectInventoryConnections()
+	disconnectOfferConnections()
 end
 
 local function cleanupAllAnimations()
@@ -241,7 +280,7 @@ end
 
 local function trackAnimation(animation)
 	table.insert(activeAnimations, animation)
-	return #activeAnimations
+	return animation
 end
 
 -- ============================================================
@@ -288,12 +327,11 @@ local function createLoadingSpinner(parent)
 	dot4.Parent = spinner
 
 	local dots = {dot1, dot2, dot3, dot4}
-	local animationConn = nil
-	local animationId = nil
-
+	local trackedAnim = nil
+	
 	local function animate()
 		local time = 0
-		animationConn = RunService.RenderStepped:Connect(function(dt)
+		local animationConn = RunService.RenderStepped:Connect(function(dt)
 			time += dt
 			for i, dot in ipairs(dots) do
 				local offset = (time * 3 + i * 0.5) % 2
@@ -302,22 +340,23 @@ local function createLoadingSpinner(parent)
 				dot.Size = UDim2.new(0, 8 * (0.7 + 0.3 * alpha), 0, 8 * (0.7 + 0.3 * alpha))
 			end
 		end)
-		animationId = trackAnimation({connection = animationConn})
+		trackedAnim = trackAnimation({connection = animationConn})
 	end
 
 	local function stop()
-		if animationConn then
-			animationConn:Disconnect()
-			animationConn = nil
+		if trackedAnim and trackedAnim.connection then
+			trackedAnim.connection:Disconnect()
+			trackedAnim.connection = nil
 		end
-		if animationId then
-			-- Remove from activeAnimations
+		-- Remove from activeAnimations
+		if trackedAnim then
 			for i, anim in ipairs(activeAnimations) do
-				if type(anim) == "table" and anim.connection == animationConn then
+				if anim == trackedAnim then
 					table.remove(activeAnimations, i)
 					break
 				end
 			end
+			trackedAnim = nil
 		end
 	end
 
@@ -759,6 +798,13 @@ local function resetButtonStates()
 		cancel = false,
 		retryLicenses = false,
 	}
+	-- Cancel any pending button timeouts
+	for buttonName, task in pairs(buttonTimeoutTasks) do
+		if task then
+			task.cancel(task)
+			buttonTimeoutTasks[buttonName] = nil
+		end
+	end
 end
 
 -- ============================================================
@@ -767,9 +813,16 @@ end
 -- Player list incremental management
 local playerEntries = {} -- Maps userId to entry Frame
 
+-- Inventory entry tracking for diff-based updates
+local inventoryEntries = {} -- Maps licenseId to entry Frame
+
+-- Offer entry tracking for diff-based updates
+local myOfferEntries = {} -- Maps licenseId to entry Frame
+local theirOfferEntries = {} -- Maps licenseId to entry Frame
+
 local function refreshPlayerList()
 	-- Disconnect all temporary connections from previous player list entries
-	disconnectTemporaryConnections()
+	disconnectPlayerListConnections()
 	
 	-- Clear only disconnected entries
 	for userId, entry in pairs(playerEntries) do
@@ -825,7 +878,7 @@ local function refreshPlayerList()
 				showToast("Trade request sent to " .. p.Name)
 				playerListFrame.Visible = false
 			end)
-			table.insert(temporaryConnections, conn)
+			table.insert(playerListConnections, conn)
 			
 			playerEntries[userId] = entry
 		end
@@ -843,6 +896,65 @@ end
 -- ============================================================
 -- PHASE 4: INVENTORY LOGIC
 -- ============================================================
+-- Trade button state helper to centralize UI reset logic
+local function setTradeButtons(stateName)
+	if stateName == "idle" then
+		readyBtn.Visible = true
+		unreadyBtn.Visible = false
+		confirmBtn.Visible = false
+		warningLabel.Visible = false
+		-- Unlock inventory
+		inventoryPanel.BackgroundTransparency = 0
+		inventoryScroll.BackgroundTransparency = 1
+	elseif stateName == "ready" then
+		readyBtn.Visible = false
+		unreadyBtn.Visible = true
+		confirmBtn.Visible = false
+		warningLabel.Visible = false
+		-- Lock inventory
+		inventoryPanel.BackgroundTransparency = 0.5
+		inventoryScroll.BackgroundTransparency = 0.5
+	elseif stateName == "confirm" then
+		readyBtn.Visible = false
+		unreadyBtn.Visible = false
+		confirmBtn.Visible = false
+		warningLabel.Visible = true
+		-- Lock inventory
+		inventoryPanel.BackgroundTransparency = 0.5
+		inventoryScroll.BackgroundTransparency = 0.5
+	elseif stateName == "both_ready" then
+		readyBtn.Visible = false
+		unreadyBtn.Visible = true
+		confirmBtn.Visible = true
+		warningLabel.Visible = true
+		warningLabel.Text = "Both ready! Confirm to complete trade."
+		warningLabel.TextColor3 = COLORS.gold
+		-- Lock inventory
+		inventoryPanel.BackgroundTransparency = 0.5
+		inventoryScroll.BackgroundTransparency = 0.5
+	elseif stateName == "waiting_partner" then
+		readyBtn.Visible = false
+		unreadyBtn.Visible = true
+		confirmBtn.Visible = false
+		warningLabel.Visible = true
+		warningLabel.Text = "Waiting for partner to ready up..."
+		warningLabel.TextColor3 = COLORS.textDim
+		-- Lock inventory
+		inventoryPanel.BackgroundTransparency = 0.5
+		inventoryScroll.BackgroundTransparency = 0.5
+	elseif stateName == "waiting_confirm" then
+		readyBtn.Visible = false
+		unreadyBtn.Visible = false
+		confirmBtn.Visible = false
+		warningLabel.Visible = true
+		warningLabel.Text = "Waiting for partner to confirm..."
+		warningLabel.TextColor3 = COLORS.accent
+		-- Lock inventory
+		inventoryPanel.BackgroundTransparency = 0.5
+		inventoryScroll.BackgroundTransparency = 0.5
+	end
+end
+
 local function resetReadyState()
 	state.myReady = false
 	state.theirReady = false
@@ -879,7 +991,15 @@ local function refreshInventory()
 		existingLoading:Destroy()
 	end
 
-	clearChildren(inventoryScroll, "Frame")
+	-- Disconnect inventory connections before diff update
+	disconnectInventoryConnections()
+
+	-- Clear only non-entry children (loading containers, etc.)
+	for _, child in ipairs(inventoryScroll:GetChildren()) do
+		if child.Name ~= "LoadingContainer" and not child:IsA("Frame") then
+			child:Destroy()
+		end
+	end
 
 	if state.licensesStatus == "loading" and #state.myLicenses == 0 then
 		-- Improved loading message with spinner
@@ -948,44 +1068,79 @@ local function refreshInventory()
 
 	local NON_TRADEABLE = {TRANSFERRED = true, REVOKED = true, EXPIRED = true}
 
+	-- Track current licenses to remove stale entries
+	local currentLicenses = {}
+	for i, lic in ipairs(state.myLicenses) do
+		currentLicenses[lic.id] = true
+	end
+
+	-- Remove entries for licenses that no longer exist
+	for licId, entry in pairs(inventoryEntries) do
+		if not currentLicenses[licId] then
+			entry:Destroy()
+			inventoryEntries[licId] = nil
+		end
+	end
+
+	-- Update or create entries for current licenses
 	for i, lic in ipairs(state.myLicenses) do
 		if offeredSet[lic.id] then continue end
 		if NON_TRADEABLE[lic.status] then continue end
 
-		local entry = Instance.new("Frame")
-		entry.Size = UDim2.new(1, 0, 0, 36)
-		entry.BackgroundColor3 = COLORS.bgDark
-		entry.BorderSizePixel = 0
-		addCorner(entry, 6)
-		entry.Parent = inventoryScroll
+		local entry = inventoryEntries[lic.id]
+		
+		if entry then
+			-- Update existing entry (status may have changed)
+			local statusLabel = entry:FindFirstChild("StatusLabel")
+			if statusLabel then
+				statusLabel.Text = lic.status
+			end
+		else
+			-- Create new entry
+			entry = Instance.new("Frame")
+			entry.Name = "LicenseEntry_" .. tostring(lic.id)
+			entry.Size = UDim2.new(1, 0, 0, 36)
+			entry.BackgroundColor3 = COLORS.bgDark
+			entry.BorderSizePixel = 0
+			addCorner(entry, 6)
+			entry.Parent = inventoryScroll
+			inventoryEntries[lic.id] = entry
 
-		-- Display license name instead of UUID
-		local displayName = lic.displayName or lic.name or tostring(lic.id)
-		local nameLabel = makeLabel(entry, displayName, FONTS.small, 12, COLORS.text)
-		nameLabel.Size = UDim2.new(0.5, 0, 1, 0)
-		nameLabel.Position = UDim2.new(0, 8, 0, 0)
+			-- Display license name instead of UUID
+			local displayName = lic.displayName or lic.name or tostring(lic.id)
+			local nameLabel = makeLabel(entry, displayName, FONTS.small, 12, COLORS.text)
+			nameLabel.Name = "NameLabel"
+			nameLabel.Size = UDim2.new(0.5, 0, 1, 0)
+			nameLabel.Position = UDim2.new(0, 8, 0, 0)
 
-		local statusLabel = makeLabel(entry, lic.status, FONTS.small, 10, COLORS.textDim)
-		statusLabel.Size = UDim2.new(0.22, 0, 1, 0)
-		statusLabel.Position = UDim2.new(0.5, 0, 0, 0)
-		statusLabel.TextXAlignment = Enum.TextXAlignment.Center
+			local statusLabel = makeLabel(entry, lic.status, FONTS.small, 10, COLORS.textDim)
+			statusLabel.Name = "StatusLabel"
+			statusLabel.Size = UDim2.new(0.22, 0, 1, 0)
+			statusLabel.Position = UDim2.new(0.5, 0, 0, 0)
+			statusLabel.TextXAlignment = Enum.TextXAlignment.Center
 
-		local addBtn = makeButton(entry, "+", COLORS.green, COLORS.text, FONTS.header, 14)
-		addBtn.Size = UDim2.new(0, 28, 0, 28)
-		addBtn.Position = UDim2.new(1, -34, 0.5, -14)
+			local addBtn = makeButton(entry, "+", COLORS.green, COLORS.text, FONTS.header, 14)
+			addBtn.Size = UDim2.new(0, 28, 0, 28)
+			addBtn.Position = UDim2.new(1, -34, 0.5, -14)
 
-		local conn = addBtn.MouseButton1Click:Connect(function()
-			if not state.currentTradeId then return end
-			-- Reset ready state locally for immediate UI feedback (without clearing offers)
-			resetReadyState()
+			local conn = addBtn.MouseButton1Click:Connect(function()
+				-- Local validation before server call
+				if not state.currentTradeId then return end
+				if state.currentState ~= TradeState.Trading then
+					showToast("Cannot modify offer in current state.")
+					return
+				end
+				-- Reset ready state locally for immediate UI feedback (without clearing offers)
+				resetReadyState()
 
-			TradeUpdateRE:FireServer({
-				tradeId = state.currentTradeId,
-				action = "AddLicense",
-				licenseId = lic.id,
-			})
-		end)
-		table.insert(temporaryConnections, conn)
+				TradeUpdateRE:FireServer({
+					tradeId = state.currentTradeId,
+					action = "AddLicense",
+					licenseId = lic.id,
+				})
+			end)
+			table.insert(inventoryConnections, conn)
+		end
 	end
 end
 
@@ -993,64 +1148,102 @@ end
 -- PHASE 5: OFFER LOGIC
 -- ============================================================
 local function refreshOffers(tradeState)
-	-- Clear temporary connections from previous offer UI
-	for _, child in ipairs(myOfferScroll:GetChildren()) do
-		if child:IsA("Frame") then
-			local btn = child:FindFirstChildOfClass("TextButton")
-			if btn then
-				-- Connections will be cleaned via disconnectTemporaryConnections
-			end
+	-- Disconnect offer connections before diff update
+	disconnectOfferConnections()
+
+	-- Track current offers to remove stale entries
+	local currentMyOffers = {}
+	for i, lic in ipairs(tradeState.myOfferedLicenses) do
+		currentMyOffers[lic.id] = true
+	end
+
+	local currentTheirOffers = {}
+	for i, lic in ipairs(tradeState.theirOfferedLicenses) do
+		currentTheirOffers[lic.id] = true
+	end
+
+	-- Remove entries for licenses that no longer exist in my offer
+	for licId, entry in pairs(myOfferEntries) do
+		if not currentMyOffers[licId] then
+			entry:Destroy()
+			myOfferEntries[licId] = nil
 		end
 	end
-	
-	clearChildren(myOfferScroll, "Frame")
-	clearChildren(theirOfferScroll, "Frame")
 
-	for i, lic in ipairs(tradeState.myOfferedLicenses) do
-		local entry = Instance.new("Frame")
-		entry.Size = UDim2.new(1, 0, 0, 32)
-		entry.BackgroundColor3 = COLORS.bgDark
-		entry.BorderSizePixel = 0
-		addCorner(entry, 6)
-		entry.Parent = myOfferScroll
-
-		-- Display license name instead of UUID
-		local displayName = lic.displayName or lic.name or tostring(lic.id)
-		local nameLabel = makeLabel(entry, displayName, FONTS.small, 12, COLORS.text)
-		nameLabel.Size = UDim2.new(0.7, 0, 1, 0)
-		nameLabel.Position = UDim2.new(0, 8, 0, 0)
-
-		local removeBtn = makeButton(entry, "\226\136\146", COLORS.red, COLORS.text, FONTS.header, 14)
-		removeBtn.Size = UDim2.new(0, 24, 0, 24)
-		removeBtn.Position = UDim2.new(1, -30, 0.5, -12)
-
-		local conn = removeBtn.MouseButton1Click:Connect(function()
-			if not state.currentTradeId then return end
-			-- Reset ready state locally for immediate UI feedback (without clearing offers)
-			resetReadyState()
-
-			TradeUpdateRE:FireServer({
-				tradeId = state.currentTradeId,
-				action = "RemoveLicense",
-				licenseId = lic.id,
-			})
-		end)
-		table.insert(temporaryConnections, conn)
+	-- Remove entries for licenses that no longer exist in their offer
+	for licId, entry in pairs(theirOfferEntries) do
+		if not currentTheirOffers[licId] then
+			entry:Destroy()
+			theirOfferEntries[licId] = nil
+		end
 	end
 
-	for i, lic in ipairs(tradeState.theirOfferedLicenses) do
-		local entry = Instance.new("Frame")
-		entry.Size = UDim2.new(1, 0, 0, 32)
-		entry.BackgroundColor3 = COLORS.bgDark
-		entry.BorderSizePixel = 0
-		addCorner(entry, 6)
-		entry.Parent = theirOfferScroll
+	-- Update or create entries for my offer
+	for i, lic in ipairs(tradeState.myOfferedLicenses) do
+		local entry = myOfferEntries[lic.id]
+		
+		if not entry then
+			-- Create new entry
+			entry = Instance.new("Frame")
+			entry.Name = "MyOfferEntry_" .. tostring(lic.id)
+			entry.Size = UDim2.new(1, 0, 0, 32)
+			entry.BackgroundColor3 = COLORS.bgDark
+			entry.BorderSizePixel = 0
+			addCorner(entry, 6)
+			entry.Parent = myOfferScroll
+			myOfferEntries[lic.id] = entry
 
-		-- Display license name instead of UUID
-		local displayName = lic.displayName or lic.name or tostring(lic.id)
-		local nameLabel = makeLabel(entry, displayName, FONTS.small, 12, COLORS.text)
-		nameLabel.Size = UDim2.new(1, -10, 1, 0)
-		nameLabel.Position = UDim2.new(0, 8, 0, 0)
+			-- Display license name instead of UUID
+			local displayName = lic.displayName or lic.name or tostring(lic.id)
+			local nameLabel = makeLabel(entry, displayName, FONTS.small, 12, COLORS.text)
+			nameLabel.Size = UDim2.new(0.7, 0, 1, 0)
+			nameLabel.Position = UDim2.new(0, 8, 0, 0)
+
+			local removeBtn = makeButton(entry, "\226\136\146", COLORS.red, COLORS.text, FONTS.header, 14)
+			removeBtn.Size = UDim2.new(0, 24, 0, 24)
+			removeBtn.Position = UDim2.new(1, -30, 0.5, -12)
+
+			local conn = removeBtn.MouseButton1Click:Connect(function()
+				-- Local validation before server call
+				if not state.currentTradeId then return end
+				if state.currentState ~= TradeState.Trading then
+					showToast("Cannot modify offer in current state.")
+					return
+				end
+				-- Reset ready state locally for immediate UI feedback (without clearing offers)
+				resetReadyState()
+
+				TradeUpdateRE:FireServer({
+					tradeId = state.currentTradeId,
+					action = "RemoveLicense",
+					licenseId = lic.id,
+				})
+			end)
+			table.insert(offerConnections, conn)
+		end
+	end
+
+	-- Update or create entries for their offer
+	for i, lic in ipairs(tradeState.theirOfferedLicenses) do
+		local entry = theirOfferEntries[lic.id]
+		
+		if not entry then
+			-- Create new entry
+			entry = Instance.new("Frame")
+			entry.Name = "TheirOfferEntry_" .. tostring(lic.id)
+			entry.Size = UDim2.new(1, 0, 0, 32)
+			entry.BackgroundColor3 = COLORS.bgDark
+			entry.BorderSizePixel = 0
+			addCorner(entry, 6)
+			entry.Parent = theirOfferScroll
+			theirOfferEntries[lic.id] = entry
+
+			-- Display license name instead of UUID
+			local displayName = lic.displayName or lic.name or tostring(lic.id)
+			local nameLabel = makeLabel(entry, displayName, FONTS.small, 12, COLORS.text)
+			nameLabel.Size = UDim2.new(1, -10, 1, 0)
+			nameLabel.Position = UDim2.new(0, 8, 0, 0)
+		end
 	end
 
 	myOfferTitle.Text = "Your Offer (" .. #tradeState.myOfferedLicenses .. ")"
@@ -1074,47 +1267,22 @@ local function updateStatus(tradeState)
 	theirConfirmLabel.TextColor3 = tradeState.theirConfirmed and COLORS.green or COLORS.textDim
 
 	if tradeState.myConfirmed then
-		readyBtn.Visible = false
-		unreadyBtn.Visible = false
-		confirmBtn.Visible = false
-		warningLabel.Text = "Waiting for partner to confirm..."
-		warningLabel.TextColor3 = COLORS.accent
-		warningLabel.Visible = true
 		setState(TradeState.Confirming)
+		setTradeButtons("waiting_confirm")
 	elseif tradeState.myReady then
-		readyBtn.Visible = false
-		unreadyBtn.Visible = true
 		if tradeState.theirReady then
-			confirmBtn.Visible = true
-			warningLabel.Text = "Both ready! Confirm to complete trade."
-			warningLabel.TextColor3 = COLORS.gold
-			warningLabel.Visible = true
 			setState(TradeState.Ready)
+			setTradeButtons("both_ready")
 		else
-			confirmBtn.Visible = false
-			warningLabel.Text = "Waiting for partner to ready up..."
-			warningLabel.TextColor3 = COLORS.textDim
-			warningLabel.Visible = true
 			setState(TradeState.Trading)
+			setTradeButtons("waiting_partner")
 		end
 	else
-		readyBtn.Visible = true
-		unreadyBtn.Visible = false
-		confirmBtn.Visible = false
-		warningLabel.Visible = false
 		setState(TradeState.Trading)
+		setTradeButtons("idle")
 	end
 
-	-- Lock inventory when Ready or Confirmed
-	if tradeState.myReady or tradeState.myConfirmed then
-		inventoryPanel.BackgroundTransparency = 0.5
-		inventoryScroll.BackgroundTransparency = 0.5
-	else
-		inventoryPanel.BackgroundTransparency = 0
-		inventoryScroll.BackgroundTransparency = 1
-	end
-
-	-- Re-enable buttons after server response
+	-- Re-enable buttons after server response and cancel timeouts
 	setAllButtonsEnabled(true)
 	resetButtonStates()
 
@@ -1192,9 +1360,13 @@ local function resetTradeUI()
 
 	-- Cleanup all animations and temporary connections
 	cleanupAllAnimations()
-	disconnectTemporaryConnections()
+	disconnectAllTemporaryConnections()
 	clearChildren(myOfferScroll, "Frame")
 	clearChildren(theirOfferScroll, "Frame")
+	clearChildren(inventoryScroll, "Frame")
+	inventoryEntries = {} -- Clear inventory entry cache
+	myOfferEntries = {} -- Clear my offer entry cache
+	theirOfferEntries = {} -- Clear their offer entry cache
 	resetReadyState()
 	
 	-- Re-enable buttons
@@ -1220,7 +1392,7 @@ fetchLicenses = function()
 		currentRetryTask = nil
 	end
 	
-	local requestId = "fetch_" .. tostring(math.floor(tick() * 1000))
+	local requestId = HttpService:GenerateGUID(false)
 	currentFetchRequestId = requestId
 	state.licensesStatus = "loading"
 	state.licensesRetryCount = 0
@@ -1228,20 +1400,20 @@ fetchLicenses = function()
 	refreshInventory()
 	GetPlayerLicensesRE:FireServer(requestId)
 	
-	-- Set timeout to prevent infinite loading
-	if fetchTimeoutTask then
-		task.cancel(fetchTimeoutTask)
-	end
+	-- Set timeout to prevent infinite loading - each request owns its timeout
+	local timeoutRequestId = requestId
 	fetchTimeoutTask = task.delay(FETCH_TIMEOUT, function()
-		if currentFetchRequestId == requestId then
-			state.licensesStatus = "error"
-			state.buttonStates.retryLicenses = false
-			showToast("License fetch timed out after " .. FETCH_TIMEOUT .. " seconds.")
-			if state.currentState == TradeState.LoadingInventory then
-				setState(TradeState.Idle)
-			end
-			refreshInventory()
+		if timeoutRequestId ~= currentFetchRequestId then
+			-- This timeout is for an old request, ignore it
+			return
 		end
+		state.licensesStatus = "error"
+		state.buttonStates.retryLicenses = false
+		showToast("License fetch timed out after " .. FETCH_TIMEOUT .. " seconds.")
+		if state.currentState == TradeState.LoadingInventory then
+			setState(TradeState.Idle)
+		end
+		refreshInventory()
 		fetchTimeoutTask = nil
 	end)
 end
@@ -1254,11 +1426,21 @@ end
 local tradeButtonConn = tradeButton.MouseButton1Click:Connect(function()
 	if state.currentTradeId then
 		tradeWindow.Visible = not tradeWindow.Visible
+		if not tradeWindow.Visible then
+			-- Clear frames immediately when closing to prevent stale UI
+			clearChildren(myOfferScroll, "Frame")
+			clearChildren(theirOfferScroll, "Frame")
+			clearChildren(inventoryScroll, "Frame")
+			inventoryEntries = {}
+			myOfferEntries = {}
+			theirOfferEntries = {}
+		end
 	else
 		playerListFrame.Visible = not playerListFrame.Visible
 		if playerListFrame.Visible then
-			setState(TradeState.SelectingPlayer)
-			refreshPlayerList()
+			if setState(TradeState.SelectingPlayer) then
+				refreshPlayerList()
+			end
 		else
 			setState(TradeState.Idle)
 		end
@@ -1271,11 +1453,21 @@ local inputBeganConn = UserInputService.InputBegan:Connect(function(input, gameP
 	if input.KeyCode == Enum.KeyCode.T then
 		if state.currentTradeId then
 			tradeWindow.Visible = not tradeWindow.Visible
+			if not tradeWindow.Visible then
+				-- Clear frames immediately when closing to prevent stale UI
+				clearChildren(myOfferScroll, "Frame")
+				clearChildren(theirOfferScroll, "Frame")
+				clearChildren(inventoryScroll, "Frame")
+				inventoryEntries = {}
+				myOfferEntries = {}
+				theirOfferEntries = {}
+			end
 		else
 			playerListFrame.Visible = not playerListFrame.Visible
 			if playerListFrame.Visible then
-				setState(TradeState.SelectingPlayer)
-				refreshPlayerList()
+				if setState(TradeState.SelectingPlayer) then
+					refreshPlayerList()
+				end
 			else
 				setState(TradeState.Idle)
 			end
@@ -1287,6 +1479,11 @@ table.insert(permanentConnections, inputBeganConn)
 local playerListCloseConn = playerListClose.MouseButton1Click:Connect(function()
 	playerListFrame.Visible = false
 	setState(TradeState.Idle)
+	-- Clear player list entries when closing
+	for userId, entry in pairs(playerEntries) do
+		entry:Destroy()
+		playerEntries[userId] = nil
+	end
 end)
 table.insert(permanentConnections, playerListCloseConn)
 
@@ -1331,7 +1528,11 @@ table.insert(permanentConnections, declineBtnConn)
 
 -- Phase 6: Ready/Unready/Confirm
 local readyBtnConn = readyBtn.MouseButton1Click:Connect(function()
-	if not state.currentTradeId then return end
+	-- Local validation before server call
+	if not state.currentTradeId then
+		showToast("No active trade.")
+		return
+	end
 	if state.buttonStates.ready then return end
 	
 	-- Prevent readying with empty offer
@@ -1340,9 +1541,26 @@ local readyBtnConn = readyBtn.MouseButton1Click:Connect(function()
 		return
 	end
 	
+	-- Validate trade state
+	if state.currentState ~= TradeState.Trading then
+		showToast("Cannot ready in current state.")
+		return
+	end
+	
 	-- Button state locking is sufficient - timestamp debounce removed as redundant
 	state.buttonStates.ready = true
 	setButtonEnabled(readyBtn, false)
+	
+	-- Set timeout for server acknowledgement
+	if buttonTimeoutTasks.ready then
+		task.cancel(buttonTimeoutTasks.ready)
+	end
+	buttonTimeoutTasks.ready = task.delay(SERVER_ACK_TIMEOUT, function()
+		state.buttonStates.ready = false
+		setButtonEnabled(readyBtn, true)
+		showToast("Server not responding. Please try again.")
+		buttonTimeoutTasks.ready = nil
+	end)
 	
 	TradeUpdateRE:FireServer({
 		tradeId = state.currentTradeId,
@@ -1353,12 +1571,33 @@ end)
 table.insert(permanentConnections, readyBtnConn)
 
 local unreadyBtnConn = unreadyBtn.MouseButton1Click:Connect(function()
-	if not state.currentTradeId then return end
+	-- Local validation before server call
+	if not state.currentTradeId then
+		showToast("No active trade.")
+		return
+	end
 	if state.buttonStates.unready then return end
+	
+	-- Validate trade state
+	if state.currentState ~= TradeState.Trading and state.currentState ~= TradeState.Ready then
+		showToast("Cannot unready in current state.")
+		return
+	end
 	
 	-- Button state locking is sufficient - timestamp debounce removed as redundant
 	state.buttonStates.unready = true
 	setButtonEnabled(unreadyBtn, false)
+	
+	-- Set timeout for server acknowledgement
+	if buttonTimeoutTasks.unready then
+		task.cancel(buttonTimeoutTasks.unready)
+	end
+	buttonTimeoutTasks.unready = task.delay(SERVER_ACK_TIMEOUT, function()
+		state.buttonStates.unready = false
+		setButtonEnabled(unreadyBtn, true)
+		showToast("Server not responding. Please try again.")
+		buttonTimeoutTasks.unready = nil
+	end)
 	
 	TradeUpdateRE:FireServer({
 		tradeId = state.currentTradeId,
@@ -1369,12 +1608,43 @@ end)
 table.insert(permanentConnections, unreadyBtnConn)
 
 local confirmBtnConn = confirmBtn.MouseButton1Click:Connect(function()
-	if not state.currentTradeId then return end
+	-- Local validation before server call
+	if not state.currentTradeId then
+		showToast("No active trade.")
+		return
+	end
 	if state.buttonStates.confirm then return end
+	
+	-- Validate trade state - can only confirm when both ready
+	if not state.myReady or not state.theirReady then
+		showToast("Both players must be ready before confirming.")
+		return
+	end
+	if state.currentState ~= TradeState.Ready then
+		showToast("Cannot confirm in current state.")
+		return
+	end
+	
+	-- Validate offer is not empty
+	if #state.myOffer == 0 then
+		showToast("Cannot confirm with empty offer.")
+		return
+	end
 	
 	-- Button state locking is sufficient - timestamp debounce removed as redundant
 	state.buttonStates.confirm = true
 	setButtonEnabled(confirmBtn, false)
+	
+	-- Set timeout for server acknowledgement
+	if buttonTimeoutTasks.confirm then
+		task.cancel(buttonTimeoutTasks.confirm)
+	end
+	buttonTimeoutTasks.confirm = task.delay(SERVER_ACK_TIMEOUT, function()
+		state.buttonStates.confirm = false
+		setButtonEnabled(confirmBtn, true)
+		showToast("Server not responding. Please try again.")
+		buttonTimeoutTasks.confirm = nil
+	end)
 	
 	TradeConfirmRE:FireServer({
 		tradeId = state.currentTradeId,
@@ -1384,12 +1654,33 @@ table.insert(permanentConnections, confirmBtnConn)
 
 -- Cancel trade
 local tradeCloseBtnConn = tradeCloseBtn.MouseButton1Click:Connect(function()
-	if not state.currentTradeId then return end
+	-- Local validation before server call
+	if not state.currentTradeId then
+		showToast("No active trade.")
+		return
+	end
 	if state.buttonStates.cancel then return end
+	
+	-- Validate trade state
+	if state.currentState ~= TradeState.Trading and state.currentState ~= TradeState.Ready then
+		showToast("Cannot cancel in current state.")
+		return
+	end
 	
 	-- Button state locking is sufficient - timestamp debounce removed as redundant
 	state.buttonStates.cancel = true
 	setButtonEnabled(tradeCloseBtn, false)
+	
+	-- Set timeout for server acknowledgement
+	if buttonTimeoutTasks.cancel then
+		task.cancel(buttonTimeoutTasks.cancel)
+	end
+	buttonTimeoutTasks.cancel = task.delay(SERVER_ACK_TIMEOUT, function()
+		state.buttonStates.cancel = false
+		setButtonEnabled(tradeCloseBtn, true)
+		showToast("Server not responding. Please try again.")
+		buttonTimeoutTasks.cancel = nil
+	end)
 	
 	TradeUpdateRE:FireServer({
 		tradeId = state.currentTradeId,
@@ -1428,8 +1719,9 @@ table.insert(permanentConnections, SendTradeRequestRE.OnClientEvent:Connect(func
 
 	currentRequestId = data.requestId
 	requestNameLabel.Text = data.requesterName .. " wants to trade!"
-	requestPopupFrame.Visible = true
-	setState(TradeState.IncomingRequest)
+	if setState(TradeState.IncomingRequest) then
+		requestPopupFrame.Visible = true
+	end
 
 	-- Reset timer bar
 	requestTimerBar.Size = UDim2.new(0.8, 0, 0, 4)
@@ -1504,18 +1796,16 @@ table.insert(permanentConnections, TradeStartedRE.OnClientEvent:Connect(function
 	state.currentTradeId = data.tradeId
 	state.partnerName = data.partnerName
 
-	tradeTitleLabel.Text = "Trading with " .. data.partnerName
-	playerListFrame.Visible = false
-	requestPopupFrame.Visible = false
-	tradeWindow.Visible = true
+	if setState(TradeState.Trading) then
+		tradeTitleLabel.Text = "Trading with " .. data.partnerName
+		playerListFrame.Visible = false
+		requestPopupFrame.Visible = false
+		tradeWindow.Visible = true
 
-	readyBtn.Visible = true
-	unreadyBtn.Visible = false
-	confirmBtn.Visible = false
-	warningLabel.Visible = false
+		setTradeButtons("idle")
 
-	setState(TradeState.Trading)
-	fetchLicenses()
+		fetchLicenses()
+	end
 end))
 
 -- Trade update (state changes, Phase 5-6)
@@ -1533,11 +1823,10 @@ table.insert(permanentConnections, TradeUpdateRE.OnClientEvent:Connect(function(
 	if data.action == "Completed" then
 		showSuccess(data.receivedLicenses or {})
 		state.currentTradeId = nil
-		setState(TradeState.Completed)
-		
-		-- Refresh licenses immediately after trade completion
-		fetchLicenses()
-		
+		if setState(TradeState.Completed) then
+			-- Refresh licenses immediately after trade completion
+			fetchLicenses()
+		end
 		return
 	end
 
@@ -1574,8 +1863,9 @@ table.insert(permanentConnections, TradeCancelledRE.OnClientEvent:Connect(functi
 		showToast("Trade ended: " .. tostring(data.reason))
 	end
 	
-	setState(TradeState.Cancelled)
-	resetTradeUI()
+	if setState(TradeState.Cancelled) then
+		resetTradeUI()
+	end
 end))
 
 -- Get player licenses response
@@ -1606,7 +1896,7 @@ table.insert(permanentConnections, GetPlayerLicensesRE.OnClientEvent:Connect(fun
 		refreshInventory()
 		currentRetryTask = task.delay(delay, function()
 			if state.licensesStatus ~= "retrying" then return end
-			local newRequestId = "fetch_" .. tostring(math.floor(tick() * 1000))
+			local newRequestId = HttpService:GenerateGUID(false)
 			currentFetchRequestId = newRequestId
 			state.licensesStatus = "loading"
 			refreshInventory()
