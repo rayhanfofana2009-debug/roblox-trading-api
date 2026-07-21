@@ -9,6 +9,23 @@ local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 
+-- ============================================================
+-- CONFIGURATION
+-- ============================================================
+local CONFIG = {
+	-- Network timeouts
+	FetchTimeout = 30, -- seconds
+	ServerAckTimeout = 5, -- seconds to wait for server response
+	ButtonDebounce = 0.5, -- seconds
+	
+	-- License retry configuration
+	LicenseMaxRetries = 3,
+	LicenseRetryDelays = {6, 12, 20}, -- seconds
+	
+	-- Request timer
+	RequestTimeout = 30, -- seconds for trade request to be accepted
+}
+
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
@@ -125,12 +142,14 @@ local function setState(newState)
 	return true
 end
 
-local LICENSE_MAX_RETRIES = 3
-local LICENSE_RETRY_DELAYS = {6, 12, 20}
 local currentFetchRequestId = nil
 local currentRetryTask = nil -- Store retry task for cancellation
-local BUTTON_DEBOUNCE_TIME = 0.5 -- seconds
-local SERVER_ACK_TIMEOUT = 5 -- seconds to wait for server response before re-enabling button
+local fetchTimeoutTask = nil -- Store fetch timeout task for cancellation
+local FETCH_TIMEOUT = CONFIG.FetchTimeout
+local SERVER_ACK_TIMEOUT = CONFIG.ServerAckTimeout
+local BUTTON_DEBOUNCE_TIME = CONFIG.ButtonDebounce
+local LICENSE_MAX_RETRIES = CONFIG.LicenseMaxRetries
+local LICENSE_RETRY_DELAYS = CONFIG.LicenseRetryDelays
 
 -- Button timeout tasks for server acknowledgement
 local buttonTimeoutTasks = {
@@ -980,87 +999,61 @@ local function resetReadyState()
 	inventoryScroll.BackgroundTransparency = 1
 end
 
-local function refreshInventory()
-	-- Stop any existing loading spinner animation
-	local existingLoading = inventoryScroll:FindFirstChild("LoadingContainer")
-	if existingLoading then
-		local stopFunc = existingLoading.StopSpinner
-		if type(stopFunc) == "function" then
-			stopFunc()
+-- Inventory UI helper functions
+local function showInventoryLoading()
+	local loadingContainer = Instance.new("Frame")
+	loadingContainer.Name = "LoadingContainer"
+	loadingContainer.Size = UDim2.new(1, 0, 0, 80)
+	loadingContainer.BackgroundTransparency = 1
+	loadingContainer.Parent = inventoryScroll
+
+	local spinner, animate, stop = createLoadingSpinner(loadingContainer)
+	animate()
+
+	local loadingLabel = makeLabel(loadingContainer, "Loading licenses...", FONTS.body, 13, COLORS.textDim)
+	loadingLabel.Size = UDim2.new(1, 0, 0, 20)
+	loadingLabel.Position = UDim2.new(0, 0, 1, -25)
+	loadingLabel.TextXAlignment = Enum.TextXAlignment.Center
+
+	local subLabel = makeLabel(loadingContainer, "This may take a few seconds.", FONTS.small, 11, COLORS.textDark)
+	subLabel.Size = UDim2.new(1, 0, 0, 16)
+	subLabel.Position = UDim2.new(0, 0, 1, -5)
+	subLabel.TextXAlignment = Enum.TextXAlignment.Center
+
+	loadingContainer.StopSpinner = stop
+end
+
+local function showInventoryRetry()
+	local retryLabel = makeLabel(inventoryScroll, "Retrying...", FONTS.body, 13, COLORS.yellow)
+	retryLabel.Size = UDim2.new(1, 0, 0, 30)
+	retryLabel.TextXAlignment = Enum.TextXAlignment.Center
+end
+
+local function showInventoryError()
+	local errorLabel = makeLabel(inventoryScroll, "Failed to load licenses", FONTS.body, 13, COLORS.red)
+	errorLabel.Size = UDim2.new(1, 0, 0, 30)
+	errorLabel.TextXAlignment = Enum.TextXAlignment.Center
+
+	local retryBtn = makeButton(inventoryScroll, "Retry", COLORS.accent, COLORS.text, FONTS.small, 12)
+	retryBtn.Size = UDim2.new(0.6, 0, 0, 30)
+	retryBtn.Position = UDim2.new(0.2, 0, 0, 35)
+
+	local conn = retryBtn.MouseButton1Click:Connect(function()
+		if state.buttonStates.retryLicenses then return end
+		state.buttonStates.retryLicenses = true
+		setButtonEnabled(retryBtn, false)
+		
+		if currentRetryTask then
+			task.cancel(currentRetryTask)
+			currentRetryTask = nil
 		end
-		existingLoading:Destroy()
-	end
+		
+		fetchLicenses()
+	end)
+	table.insert(temporaryConnections, conn)
+end
 
-	-- Disconnect inventory connections before diff update
-	disconnectInventoryConnections()
-
-	-- Clear only non-entry children (loading containers, etc.)
-	for _, child in ipairs(inventoryScroll:GetChildren()) do
-		if child.Name ~= "LoadingContainer" and not child:IsA("Frame") then
-			child:Destroy()
-		end
-	end
-
-	if state.licensesStatus == "loading" and #state.myLicenses == 0 then
-		-- Improved loading message with spinner
-		local loadingContainer = Instance.new("Frame")
-		loadingContainer.Name = "LoadingContainer"
-		loadingContainer.Size = UDim2.new(1, 0, 0, 80)
-		loadingContainer.BackgroundTransparency = 1
-		loadingContainer.Parent = inventoryScroll
-
-		local spinner, animate, stop = createLoadingSpinner(loadingContainer)
-		animate()
-
-		local loadingLabel = makeLabel(loadingContainer, "Loading licenses...", FONTS.body, 13, COLORS.textDim)
-		loadingLabel.Size = UDim2.new(1, 0, 0, 20)
-		loadingLabel.Position = UDim2.new(0, 0, 1, -25)
-		loadingLabel.TextXAlignment = Enum.TextXAlignment.Center
-
-		local subLabel = makeLabel(loadingContainer, "This may take a few seconds.", FONTS.small, 11, COLORS.textDark)
-		subLabel.Size = UDim2.new(1, 0, 0, 16)
-		subLabel.Position = UDim2.new(0, 0, 1, -5)
-		subLabel.TextXAlignment = Enum.TextXAlignment.Center
-
-		-- Store stop function directly in container for cleanup when UI is rebuilt
-		loadingContainer.StopSpinner = stop
-		return
-	end
-
-	if state.licensesStatus == "retrying" and #state.myLicenses == 0 then
-		local retryLabel = makeLabel(inventoryScroll, "Retrying...", FONTS.body, 13, COLORS.yellow)
-		retryLabel.Size = UDim2.new(1, 0, 0, 30)
-		retryLabel.TextXAlignment = Enum.TextXAlignment.Center
-		return
-	end
-
-	if state.licensesStatus == "error" and #state.myLicenses == 0 then
-		local errorLabel = makeLabel(inventoryScroll, "Failed to load licenses", FONTS.body, 13, COLORS.red)
-		errorLabel.Size = UDim2.new(1, 0, 0, 30)
-		errorLabel.TextXAlignment = Enum.TextXAlignment.Center
-
-		local retryBtn = makeButton(inventoryScroll, "Retry", COLORS.accent, COLORS.text, FONTS.small, 12)
-		retryBtn.Size = UDim2.new(0.6, 0, 0, 30)
-		retryBtn.Position = UDim2.new(0.2, 0, 0, 35)
-
-		local conn = retryBtn.MouseButton1Click:Connect(function()
-			-- Button state locking is sufficient - timestamp debounce removed as redundant
-			if state.buttonStates.retryLicenses then return end
-			state.buttonStates.retryLicenses = true
-			setButtonEnabled(retryBtn, false)
-			
-			-- Cancel any existing retry task
-			if currentRetryTask then
-				task.cancel(currentRetryTask)
-				currentRetryTask = nil
-			end
-			
-			fetchLicenses()
-		end)
-		table.insert(temporaryConnections, conn)
-		return
-	end
-
+local function buildInventoryEntries()
 	local offeredSet = {}
 	for _, licId in ipairs(state.myOffer) do
 		offeredSet[licId] = true
@@ -1106,7 +1099,6 @@ local function refreshInventory()
 			entry.Parent = inventoryScroll
 			inventoryEntries[lic.id] = entry
 
-			-- Display license name instead of UUID
 			local displayName = lic.displayName or lic.name or tostring(lic.id)
 			local nameLabel = makeLabel(entry, displayName, FONTS.small, 12, COLORS.text)
 			nameLabel.Name = "NameLabel"
@@ -1124,13 +1116,11 @@ local function refreshInventory()
 			addBtn.Position = UDim2.new(1, -34, 0.5, -14)
 
 			local conn = addBtn.MouseButton1Click:Connect(function()
-				-- Local validation before server call
 				if not state.currentTradeId then return end
 				if state.currentState ~= TradeState.Trading then
 					showToast("Cannot modify offer in current state.")
 					return
 				end
-				-- Reset ready state locally for immediate UI feedback (without clearing offers)
 				resetReadyState()
 
 				TradeUpdateRE:FireServer({
@@ -1142,6 +1132,45 @@ local function refreshInventory()
 			table.insert(inventoryConnections, conn)
 		end
 	end
+end
+
+local function refreshInventory()
+	-- Stop any existing loading spinner animation
+	local existingLoading = inventoryScroll:FindFirstChild("LoadingContainer")
+	if existingLoading then
+		local stopFunc = existingLoading.StopSpinner
+		if type(stopFunc) == "function" then
+			stopFunc()
+		end
+		existingLoading:Destroy()
+	end
+
+	-- Disconnect inventory connections before diff update
+	disconnectInventoryConnections()
+
+	-- Clear only non-entry children (loading containers, etc.)
+	for _, child in ipairs(inventoryScroll:GetChildren()) do
+		if child.Name ~= "LoadingContainer" and not child:IsA("Frame") then
+			child:Destroy()
+		end
+	end
+
+	if state.licensesStatus == "loading" and #state.myLicenses == 0 then
+		showInventoryLoading()
+		return
+	end
+
+	if state.licensesStatus == "retrying" and #state.myLicenses == 0 then
+		showInventoryRetry()
+		return
+	end
+
+	if state.licensesStatus == "error" and #state.myLicenses == 0 then
+		showInventoryError()
+		return
+	end
+
+	buildInventoryEntries()
 end
 
 -- ============================================================
@@ -1367,6 +1396,12 @@ local function resetTradeUI()
 	inventoryEntries = {} -- Clear inventory entry cache
 	myOfferEntries = {} -- Clear my offer entry cache
 	theirOfferEntries = {} -- Clear their offer entry cache
+	
+	-- Clear state data
+	state.myLicenses = {}
+	state.myOffer = {}
+	state.theirOffer = {}
+	
 	resetReadyState()
 	
 	-- Re-enable buttons
@@ -1402,14 +1437,14 @@ fetchLicenses = function()
 	
 	-- Set timeout to prevent infinite loading - each request owns its timeout
 	local timeoutRequestId = requestId
-	fetchTimeoutTask = task.delay(FETCH_TIMEOUT, function()
+	fetchTimeoutTask = task.delay(CONFIG.FetchTimeout, function()
 		if timeoutRequestId ~= currentFetchRequestId then
 			-- This timeout is for an old request, ignore it
 			return
 		end
 		state.licensesStatus = "error"
 		state.buttonStates.retryLicenses = false
-		showToast("License fetch timed out after " .. FETCH_TIMEOUT .. " seconds.")
+		showToast("License fetch timed out after " .. CONFIG.FetchTimeout .. " seconds.")
 		if state.currentState == TradeState.LoadingInventory then
 			setState(TradeState.Idle)
 		end
@@ -1555,7 +1590,7 @@ local readyBtnConn = readyBtn.MouseButton1Click:Connect(function()
 	if buttonTimeoutTasks.ready then
 		task.cancel(buttonTimeoutTasks.ready)
 	end
-	buttonTimeoutTasks.ready = task.delay(SERVER_ACK_TIMEOUT, function()
+	buttonTimeoutTasks.ready = task.delay(CONFIG.ServerAckTimeout, function()
 		state.buttonStates.ready = false
 		setButtonEnabled(readyBtn, true)
 		showToast("Server not responding. Please try again.")
@@ -1592,7 +1627,7 @@ local unreadyBtnConn = unreadyBtn.MouseButton1Click:Connect(function()
 	if buttonTimeoutTasks.unready then
 		task.cancel(buttonTimeoutTasks.unready)
 	end
-	buttonTimeoutTasks.unready = task.delay(SERVER_ACK_TIMEOUT, function()
+	buttonTimeoutTasks.unready = task.delay(CONFIG.ServerAckTimeout, function()
 		state.buttonStates.unready = false
 		setButtonEnabled(unreadyBtn, true)
 		showToast("Server not responding. Please try again.")
@@ -1639,7 +1674,7 @@ local confirmBtnConn = confirmBtn.MouseButton1Click:Connect(function()
 	if buttonTimeoutTasks.confirm then
 		task.cancel(buttonTimeoutTasks.confirm)
 	end
-	buttonTimeoutTasks.confirm = task.delay(SERVER_ACK_TIMEOUT, function()
+	buttonTimeoutTasks.confirm = task.delay(CONFIG.ServerAckTimeout, function()
 		state.buttonStates.confirm = false
 		setButtonEnabled(confirmBtn, true)
 		showToast("Server not responding. Please try again.")
@@ -1675,7 +1710,7 @@ local tradeCloseBtnConn = tradeCloseBtn.MouseButton1Click:Connect(function()
 	if buttonTimeoutTasks.cancel then
 		task.cancel(buttonTimeoutTasks.cancel)
 	end
-	buttonTimeoutTasks.cancel = task.delay(SERVER_ACK_TIMEOUT, function()
+	buttonTimeoutTasks.cancel = task.delay(CONFIG.ServerAckTimeout, function()
 		state.buttonStates.cancel = false
 		setButtonEnabled(tradeCloseBtn, true)
 		showToast("Server not responding. Please try again.")
@@ -1790,6 +1825,12 @@ table.insert(permanentConnections, TradeStartedRE.OnClientEvent:Connect(function
 	-- Validate data structure
 	if not data or not data.tradeId or not data.partnerName then
 		warn("[TradeClient] Invalid trade started data")
+		return
+	end
+	
+	-- Prevent late-arriving packets from opening old windows
+	if state.currentTradeId then
+		warn("[TradeClient] Ignoring trade start - already in trade")
 		return
 	end
 	
