@@ -17,6 +17,11 @@ const ownershipVerifyQuery = z.object({
   licenseTypeId: z.string().uuid()
 });
 
+const licenseVerifyBody = z.object({
+  userId: z.coerce.bigint(),
+  licenseId: z.string().uuid()
+});
+
 const transferParams = z.object({
   licenseId: z.string().uuid()
 });
@@ -122,6 +127,35 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
               updatedAt: activeLicense.updatedAt
             }
           : null
+      }
+    });
+  });
+
+  app.post("/v1/licenses/verify-instance", async (request, reply) => {
+    const parsedBody = licenseVerifyBody.safeParse(request.body);
+    if (!parsedBody.success) {
+      return reply.badRequest("Invalid request body.");
+    }
+
+    const { userId, licenseId } = parsedBody.data;
+
+    const license = await prisma.license.findUnique({
+      where: {
+        id: licenseId
+      },
+      select: {
+        ownerUserId: true,
+        status: true
+      }
+    });
+
+    const isValid = license &&
+                    license.ownerUserId === userId &&
+                    license.status === LicenseStatus.ACTIVE;
+
+    return reply.send({
+      data: {
+        valid: isValid
       }
     });
   });

@@ -7,6 +7,12 @@ const verifyPurchaseBody = z.object({
     universeId: z.coerce.bigint(),
     gamepassId: z.coerce.bigint()
 });
+const createPurchaseSourceBody = z.object({
+    universeId: z.coerce.bigint(),
+    gamepassId: z.coerce.bigint(),
+    licenseTypeId: z.string().uuid(),
+    displayName: z.string().min(1)
+});
 export async function registerPurchaseRoutes(app) {
     app.post("/v1/purchases/verify", async (request, reply) => {
         const parsed = verifyPurchaseBody.safeParse(request.body);
@@ -80,6 +86,77 @@ export async function registerPurchaseRoutes(app) {
                 purchaseId: created.purchase.id,
                 licenseId: created.license.id,
                 idempotentReplay: false
+            }
+        });
+    });
+    app.get("/v1/purchase-sources", async (request, reply) => {
+        const purchaseSources = await prisma.purchaseSource.findMany({
+            include: { licenseType: true }
+        });
+        return reply.send({
+            data: purchaseSources.map(ps => ({
+                id: ps.id,
+                universeId: ps.universeId.toString(),
+                gamepassId: ps.gamepassId.toString(),
+                licenseTypeId: ps.licenseTypeId,
+                displayName: ps.licenseType.displayName
+            }))
+        });
+    });
+    app.delete("/v1/purchase-sources/:id", async (request, reply) => {
+        const { id } = request.params;
+        await prisma.purchaseSource.delete({
+            where: { id }
+        });
+        return reply.code(204).send();
+    });
+    app.post("/v1/purchase-sources", async (request, reply) => {
+        const parsed = createPurchaseSourceBody.safeParse(request.body);
+        if (!parsed.success) {
+            return reply.badRequest("Invalid request body.");
+        }
+        const { universeId, gamepassId, licenseTypeId, displayName } = parsed.data;
+        // Check if license type exists, create if not
+        let licenseType = await prisma.licenseType.findUnique({
+            where: { id: licenseTypeId }
+        });
+        if (!licenseType) {
+            licenseType = await prisma.licenseType.create({
+                data: {
+                    id: licenseTypeId,
+                    displayName,
+                    tradable: true,
+                    stackable: false
+                }
+            });
+        }
+        // Check if purchase source already exists
+        const existing = await prisma.purchaseSource.findUnique({
+            where: {
+                universeId_gamepassId: { universeId, gamepassId }
+            }
+        });
+        if (existing) {
+            return reply.conflict("Purchase source already exists for this universe/gamepass.");
+        }
+        // Create purchase source
+        const purchaseSource = await prisma.purchaseSource.create({
+            data: {
+                universeId,
+                gamepassId,
+                licenseTypeId
+            },
+            include: {
+                licenseType: true
+            }
+        });
+        return reply.code(201).send({
+            data: {
+                id: purchaseSource.id,
+                universeId: purchaseSource.universeId.toString(),
+                gamepassId: purchaseSource.gamepassId.toString(),
+                licenseTypeId: purchaseSource.licenseTypeId,
+                displayName: purchaseSource.licenseType.displayName
             }
         });
     });

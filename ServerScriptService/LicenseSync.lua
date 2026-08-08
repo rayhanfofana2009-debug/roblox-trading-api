@@ -250,7 +250,7 @@ local function scheduleBackgroundRetry(player, retryCount)
 		if not claimResult then
 			warn("Background claim failed for " .. player.Name .. ": " .. tostring(claimErr))
 			-- Schedule another retry if this wasn't the last attempt
-			if (retryCount or 1) < 3 then
+			if (retryCount or 1) < 4 then
 				scheduleBackgroundRetry(player, (retryCount or 1) + 1)
 			end
 			return
@@ -262,7 +262,7 @@ local function scheduleBackgroundRetry(player, retryCount)
 		if not licensesResult then
 			warn("Background fetch failed for " .. player.Name .. ": " .. tostring(licensesErr))
 			-- Schedule another retry if this wasn't the last attempt
-			if (retryCount or 1) < 3 then
+			if (retryCount or 1) < 4 then
 				scheduleBackgroundRetry(player, (retryCount or 1) + 1)
 			end
 			return

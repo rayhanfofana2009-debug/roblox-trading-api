@@ -1,119 +1,81 @@
--- TradeClient (LocalScript)
--- Complete 7-phase trading UI client
--- Phases: Player List → Request Popup → Trade Window → Inventory → Offers → Ready/Confirm → Success
+--[[
+	TradeClient.lua
+	Client-side trading orchestrator - slimmed from ~2000 lines to this.
+	Lives in StarterPlayerScripts.Trade, alongside Controllers/ and UI/.
+
+	CONFIDENCE KEY:
+	  [VERIFIED]      taken directly from code you pasted, unchanged
+	  [RECONSTRUCTED] inferred from strong evidence but not itself confirmed -
+	                  verify against the monolith before trusting in production
+]]
 
 local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
-
--- ============================================================
--- CONFIGURATION
--- ============================================================
-local CONFIG = {
-	-- Network timeouts
-	FetchTimeout = 30, -- seconds
-	ServerAckTimeout = 5, -- seconds to wait for server response
-	ButtonDebounce = 0.5, -- seconds
-	
-	-- License retry configuration
-	LicenseMaxRetries = 3,
-	LicenseRetryDelays = {6, 12, 20}, -- seconds
-	
-	-- Request timer
-	RequestTimeout = 30, -- seconds for trade request to be accepted
-}
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
+local playerGui = player:WaitForChild("PlayerGui") -- [VERIFIED]
 
+-- ============================================================
+-- REMOTES  [VERIFIED - lines 35-41]
+-- ============================================================
 local GameRemotes = ReplicatedStorage:WaitForChild("GameRemotes")
-
--- RemoteEvents
-local SendTradeRequestRE = GameRemotes:WaitForChild("SendTradeRequest")
-local TradeRequestResponseRE = GameRemotes:WaitForChild("TradeRequestResponse")
-local TradeStartedRE = GameRemotes:WaitForChild("TradeStarted")
-local TradeUpdateRE = GameRemotes:WaitForChild("TradeUpdate")
-local TradeConfirmRE = GameRemotes:WaitForChild("TradeConfirm")
-local TradeCancelledRE = GameRemotes:WaitForChild("TradeCancelled")
-local GetPlayerLicensesRE = GameRemotes:WaitForChild("GetPlayerLicenses")
-
--- ============================================================
--- THEME
--- ============================================================
-local COLORS = {
-	bg = Color3.fromRGB(30, 30, 35),
-	bgLight = Color3.fromRGB(40, 40, 48),
-	bgDark = Color3.fromRGB(20, 20, 25),
-	bgHover = Color3.fromRGB(50, 50, 58),
-	accent = Color3.fromRGB(0, 170, 255),
-	accentDark = Color3.fromRGB(0, 120, 200),
-	green = Color3.fromRGB(0, 200, 80),
-	greenDark = Color3.fromRGB(0, 150, 60),
-	red = Color3.fromRGB(220, 50, 50),
-	redDark = Color3.fromRGB(180, 30, 30),
-	yellow = Color3.fromRGB(255, 200, 0),
-	text = Color3.fromRGB(240, 240, 240),
-	textDim = Color3.fromRGB(160, 160, 170),
-	textDark = Color3.fromRGB(100, 100, 110),
-	border = Color3.fromRGB(60, 60, 70),
-	success = Color3.fromRGB(50, 205, 50),
-	gold = Color3.fromRGB(255, 215, 0),
-	disabled = Color3.fromRGB(80, 80, 90),
-}
-
-local FONTS = {
-	title = Enum.Font.GothamBold,
-	header = Enum.Font.GothamSemibold,
-	body = Enum.Font.Gotham,
-	small = Enum.Font.GothamMedium,
+local remotes = {
+	sendTradeRequest = GameRemotes:WaitForChild("SendTradeRequest"),
+	tradeRequestResponse = GameRemotes:WaitForChild("TradeRequestResponse"),
+	tradeStarted = GameRemotes:WaitForChild("TradeStarted"),
+	tradeUpdate = GameRemotes:WaitForChild("TradeUpdate"),
+	tradeConfirm = GameRemotes:WaitForChild("TradeConfirm"),
+	tradeCancelled = GameRemotes:WaitForChild("TradeCancelled"),
+	getPlayerLicenses = GameRemotes:WaitForChild("GetPlayerLicenses"),
 }
 
 -- ============================================================
--- STATE MACHINE
+-- SHARED MODULES  [VERIFIED]
 -- ============================================================
-local TradeState = {
-	Idle = "Idle",
-	SelectingPlayer = "SelectingPlayer",
-	WaitingForRequestResponse = "WaitingForRequestResponse",
-	IncomingRequest = "IncomingRequest",
-	LoadingInventory = "LoadingInventory",
-	Trading = "Trading",
-	Ready = "Ready",
-	Confirming = "Confirming",
-	Completed = "Completed",
-	Cancelled = "Cancelled",
+local SharedModules = ReplicatedStorage:WaitForChild("SharedModules")
+local TradeState = require(SharedModules:WaitForChild("TradeState"))
+
+-- ============================================================
+-- TRADE-LOCAL MODULES  [VERIFIED constructor signatures]
+-- ============================================================
+local Controllers = script.Parent:WaitForChild("Controllers")
+local UI = script.Parent:WaitForChild("UI")
+
+local InventoryController = require(Controllers:WaitForChild("InventoryController"))
+local OfferController = require(Controllers:WaitForChild("OfferController"))
+local NotificationController = require(Controllers:WaitForChild("NotificationController"))
+local SuccessController = require(Controllers:WaitForChild("SuccessController"))
+local StatusController = require(Controllers:WaitForChild("StatusController"))
+local TradeController = require(Controllers:WaitForChild("TradeController"))
+
+local InventoryUI = require(UI:WaitForChild("InventoryUI"))
+local OfferUI = require(UI:WaitForChild("OfferUI"))
+local StatusUI = require(UI:WaitForChild("StatusUI"))
+local SuccessUI = require(UI:WaitForChild("SuccessUI"))
+local ToastUI = require(UI:WaitForChild("ToastUI"))
+local TradeWindowUI = require(UI:WaitForChild("TradeWindowUI"))
+local PlayerListUI = require(UI:WaitForChild("PlayerListUI"))
+
+-- ============================================================
+-- CONFIG  [VERIFIED - from your recap]
+-- ============================================================
+local CONFIG = {
+	FetchTimeout = 30,
+	ServerAckTimeout = 5,
+	ButtonDebounce = 0.5,
+	LicenseMaxRetries = 3,
+	LicenseRetryDelays = { 6, 12, 20 },
+	RequestTimeout = 30,
 }
 
--- Valid state transitions
-local STATE_TRANSITIONS = {
-	[TradeState.Idle] = {TradeState.SelectingPlayer, TradeState.IncomingRequest, TradeState.LoadingInventory},
-	[TradeState.SelectingPlayer] = {TradeState.Idle, TradeState.WaitingForRequestResponse},
-	[TradeState.WaitingForRequestResponse] = {TradeState.Idle, TradeState.Trading},
-	[TradeState.IncomingRequest] = {TradeState.Idle, TradeState.Trading},
-	[TradeState.LoadingInventory] = {TradeState.Idle, TradeState.Trading},
-	[TradeState.Trading] = {TradeState.Ready, TradeState.Cancelled},
-	[TradeState.Ready] = {TradeState.Trading, TradeState.Confirming, TradeState.Cancelled},
-	[TradeState.Confirming] = {TradeState.Completed, TradeState.Cancelled},
-	[TradeState.Completed] = {TradeState.Idle},
-	[TradeState.Cancelled] = {TradeState.Idle},
-}
-
-local function canTransition(fromState, toState)
-	local validTransitions = STATE_TRANSITIONS[fromState]
-	if not validTransitions then return false end
-	for _, validState in ipairs(validTransitions) do
-		if validState == toState then return true end
-	end
-	return false
-end
-
+-- ============================================================
+-- RUNTIME STATE  [VERIFIED - lines 88-106]
+-- ============================================================
 local state = {
-	currentState = TradeState.Idle,
 	currentTradeId = nil,
 	partnerName = nil,
+	partnerId = nil,
 	myLicenses = {},
 	myOffer = {},
 	theirOffer = {},
@@ -123,7 +85,6 @@ local state = {
 	theirConfirmed = false,
 	licensesRetryCount = 0,
 	licensesStatus = "idle",
-	-- Button state management (simplified - buttons are disabled via setButtonEnabled)
 	buttonStates = {
 		ready = false,
 		unready = false,
@@ -133,257 +94,8 @@ local state = {
 	},
 }
 
-local function setState(newState)
-	if not canTransition(state.currentState, newState) then
-		warn("[TradeClient] Invalid state transition: " .. state.currentState .. " -> " .. newState)
-		return false
-	end
-	state.currentState = newState
-	return true
-end
-
-local currentFetchRequestId = nil
-local currentRetryTask = nil -- Store retry task for cancellation
-local fetchTimeoutTask = nil -- Store fetch timeout task for cancellation
-local FETCH_TIMEOUT = CONFIG.FetchTimeout
-local SERVER_ACK_TIMEOUT = CONFIG.ServerAckTimeout
-local BUTTON_DEBOUNCE_TIME = CONFIG.ButtonDebounce
-local LICENSE_MAX_RETRIES = CONFIG.LicenseMaxRetries
-local LICENSE_RETRY_DELAYS = CONFIG.LicenseRetryDelays
-
--- Button timeout tasks for server acknowledgement
-local buttonTimeoutTasks = {
-	ready = nil,
-	unready = nil,
-	confirm = nil,
-	cancel = nil,
-}
-
--- Connection management: separate permanent from temporary
-local permanentConnections = {} -- RemoteEvent listeners, PlayerAdded/Removing, global input
-local playerListConnections = {} -- Player list button connections
-local inventoryConnections = {} -- Inventory add button connections
-local offerConnections = {} -- Offer remove button connections
-
--- Animation cleanup tracking
-local activeAnimations = {} -- Track all active RenderStepped connections and Tweens
-
--- Forward declare functions used in callbacks
-local fetchLicenses
-local disconnectPlayerListConnections
-local disconnectInventoryConnections
-local disconnectOfferConnections
-
 -- ============================================================
--- UI HELPERS
--- ============================================================
-local function addCorner(parent, radius)
-	local c = Instance.new("UICorner")
-	c.CornerRadius = UDim.new(0, radius or 8)
-	c.Parent = parent
-	return c
-end
-
-local function addStroke(parent, color, thickness)
-	local s = Instance.new("UIStroke")
-	s.Color = color or COLORS.border
-	s.Thickness = thickness or 1
-	s.Parent = parent
-	return s
-end
-
-local function addPadding(parent, t, b, l, r)
-	local p = Instance.new("UIPadding")
-	p.PaddingTop = UDim.new(0, t or 0)
-	p.PaddingBottom = UDim.new(0, b or 0)
-	p.PaddingLeft = UDim.new(0, l or 0)
-	p.PaddingRight = UDim.new(0, r or 0)
-	p.Parent = parent
-	return p
-end
-
-local function makeLabel(parent, text, font, size, color)
-	local l = Instance.new("TextLabel")
-	l.BackgroundTransparency = 1
-	l.Text = text or ""
-	l.Font = font or FONTS.body
-	l.TextSize = size or 14
-	l.TextColor3 = color or COLORS.text
-	l.TextXAlignment = Enum.TextXAlignment.Left
-	l.Size = UDim2.new(1, 0, 0, 20)
-	l.Parent = parent
-	return l
-end
-
-local function makeButton(parent, text, bgColor, textColor, font, textSize)
-	local b = Instance.new("TextButton")
-	b.BackgroundColor3 = bgColor or COLORS.accent
-	b.TextColor3 = textColor or COLORS.text
-	b.Text = text or ""
-	b.Font = font or FONTS.header
-	b.TextSize = textSize or 14
-	b.AutoButtonColor = true
-	b.Size = UDim2.new(1, 0, 0, 36)
-	addCorner(b, 6)
-	addStroke(b, Color3.new(0, 0, 0), 0)
-	b.Parent = parent
-	return b
-end
-
-local function setButtonEnabled(button, enabled)
-	if not button then return end
-	button.Active = enabled
-	button.AutoButtonColor = enabled
-	button.TextColor3 = enabled and COLORS.text or COLORS.textDim
-	button.BackgroundColor3 = enabled and COLORS.accent or COLORS.disabled
-end
-
-local function clearChildren(frame, className)
-	for _, child in ipairs(frame:GetChildren()) do
-		if child:IsA(className or "Frame") then
-			child:Destroy()
-		end
-	end
-end
-
-local function disconnectPlayerListConnections()
-	for _, conn in ipairs(playerListConnections) do
-		if conn then
-			conn:Disconnect()
-		end
-	end
-	playerListConnections = {}
-end
-
-local function disconnectInventoryConnections()
-	for _, conn in ipairs(inventoryConnections) do
-		if conn then
-			conn:Disconnect()
-		end
-	end
-	inventoryConnections = {}
-end
-
-local function disconnectOfferConnections()
-	for _, conn in ipairs(offerConnections) do
-		if conn then
-			conn:Disconnect()
-		end
-	end
-	offerConnections = {}
-end
-
-local function disconnectAllTemporaryConnections()
-	disconnectPlayerListConnections()
-	disconnectInventoryConnections()
-	disconnectOfferConnections()
-end
-
-local function cleanupAllAnimations()
-	for _, anim in ipairs(activeAnimations) do
-		if type(anim) == "table" then
-			if anim.connection then
-				anim.connection:Disconnect()
-			end
-			if anim.tween then
-				anim.tween:Cancel()
-			end
-		elseif typeof(anim) == "RBXScriptConnection" then
-			anim:Disconnect()
-		elseif typeof(anim) == "Tween" then
-			anim:Cancel()
-		end
-	end
-	activeAnimations = {}
-end
-
-local function trackAnimation(animation)
-	table.insert(activeAnimations, animation)
-	return animation
-end
-
--- ============================================================
--- LOADING SPINNER
--- ============================================================
-local function createLoadingSpinner(parent)
-	local spinner = Instance.new("Frame")
-	spinner.Name = "LoadingSpinner"
-	spinner.Size = UDim2.new(0, 40, 0, 40)
-	spinner.Position = UDim2.new(0.5, -20, 0.5, -20)
-	spinner.BackgroundTransparency = 1
-	spinner.Parent = parent
-
-	local dot1 = Instance.new("Frame")
-	dot1.Size = UDim2.new(0, 8, 0, 8)
-	dot1.Position = UDim2.new(0.5, -12, 0.5, -12)
-	dot1.BackgroundColor3 = COLORS.accent
-	dot1.BorderSizePixel = 0
-	addCorner(dot1, 4)
-	dot1.Parent = spinner
-
-	local dot2 = Instance.new("Frame")
-	dot2.Size = UDim2.new(0, 8, 0, 8)
-	dot2.Position = UDim2.new(0.5, 4, 0.5, -12)
-	dot2.BackgroundColor3 = COLORS.accent
-	dot2.BorderSizePixel = 0
-	addCorner(dot2, 4)
-	dot2.Parent = spinner
-
-	local dot3 = Instance.new("Frame")
-	dot3.Size = UDim2.new(0, 8, 0, 8)
-	dot3.Position = UDim2.new(0.5, -4, 0.5, 4)
-	dot3.BackgroundColor3 = COLORS.accent
-	dot3.BorderSizePixel = 0
-	addCorner(dot3, 4)
-	dot3.Parent = spinner
-
-	local dot4 = Instance.new("Frame")
-	dot4.Size = UDim2.new(0, 8, 0, 8)
-	dot4.Position = UDim2.new(0.5, 12, 0.5, 4)
-	dot4.BackgroundColor3 = COLORS.accent
-	dot4.BorderSizePixel = 0
-	addCorner(dot4, 4)
-	dot4.Parent = spinner
-
-	local dots = {dot1, dot2, dot3, dot4}
-	local trackedAnim = nil
-	
-	local function animate()
-		local time = 0
-		local animationConn = RunService.RenderStepped:Connect(function(dt)
-			time += dt
-			for i, dot in ipairs(dots) do
-				local offset = (time * 3 + i * 0.5) % 2
-				local alpha = offset < 1 and offset or 2 - offset
-				dot.BackgroundColor3 = COLORS.accent:Lerp(COLORS.textDim, alpha)
-				dot.Size = UDim2.new(0, 8 * (0.7 + 0.3 * alpha), 0, 8 * (0.7 + 0.3 * alpha))
-			end
-		end)
-		trackedAnim = trackAnimation({connection = animationConn})
-	end
-
-	local function stop()
-		if trackedAnim and trackedAnim.connection then
-			trackedAnim.connection:Disconnect()
-			trackedAnim.connection = nil
-		end
-		-- Remove from activeAnimations
-		if trackedAnim then
-			for i, anim in ipairs(activeAnimations) do
-				if anim == trackedAnim then
-					table.remove(activeAnimations, i)
-					break
-				end
-			end
-			trackedAnim = nil
-		end
-	end
-
-	return spinner, animate, stop
-end
-
--- ============================================================
--- MAIN SCREEN GUI
+-- GUI CONSTRUCTION  [VERIFIED - lines 388-746 from monolith]
 -- ============================================================
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "TradeUI"
@@ -399,13 +111,18 @@ local tradeButton = Instance.new("TextButton")
 tradeButton.Name = "TradeButton"
 tradeButton.Size = UDim2.new(0, 120, 0, 40)
 tradeButton.Position = UDim2.new(1, -140, 1, -60)
-tradeButton.BackgroundColor3 = COLORS.accent
-tradeButton.TextColor3 = COLORS.text
+tradeButton.BackgroundColor3 = Color3.fromRGB(0, 170, 255)
+tradeButton.TextColor3 = Color3.fromRGB(240, 240, 240)
 tradeButton.Text = "Trade [T]"
-tradeButton.Font = FONTS.header
+tradeButton.Font = Enum.Font.GothamSemibold
 tradeButton.TextSize = 14
-addCorner(tradeButton, 8)
-addStroke(tradeButton, COLORS.accentDark, 2)
+local corner1 = Instance.new("UICorner")
+corner1.CornerRadius = UDim.new(0, 8)
+corner1.Parent = tradeButton
+local stroke1 = Instance.new("UIStroke")
+stroke1.Color = Color3.fromRGB(0, 120, 200)
+stroke1.Thickness = 2
+stroke1.Parent = tradeButton
 tradeButton.Parent = screenGui
 
 -- Player List Frame
@@ -413,20 +130,44 @@ local playerListFrame = Instance.new("Frame")
 playerListFrame.Name = "PlayerListFrame"
 playerListFrame.Size = UDim2.new(0, 300, 0, 400)
 playerListFrame.Position = UDim2.new(0.5, -150, 0.5, -200)
-playerListFrame.BackgroundColor3 = COLORS.bg
+playerListFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
 playerListFrame.BorderSizePixel = 0
 playerListFrame.Visible = false
-addCorner(playerListFrame, 12)
-addStroke(playerListFrame, COLORS.border, 2)
+local corner2 = Instance.new("UICorner")
+corner2.CornerRadius = UDim.new(0, 12)
+corner2.Parent = playerListFrame
+local stroke2 = Instance.new("UIStroke")
+stroke2.Color = Color3.fromRGB(60, 60, 70)
+stroke2.Thickness = 2
+stroke2.Parent = playerListFrame
 playerListFrame.Parent = screenGui
 
-local playerListTitle = makeLabel(playerListFrame, "Select Player to Trade", FONTS.title, 18, COLORS.text)
+local playerListTitle = Instance.new("TextLabel")
+playerListTitle.BackgroundTransparency = 1
+playerListTitle.Text = "Select Player to Trade"
+playerListTitle.Font = Enum.Font.GothamBold
+playerListTitle.TextSize = 18
+playerListTitle.TextColor3 = Color3.fromRGB(240, 240, 240)
 playerListTitle.Size = UDim2.new(1, -50, 0, 40)
 playerListTitle.Position = UDim2.new(0, 15, 0, 5)
+playerListTitle.Parent = playerListFrame
 
-local playerListClose = makeButton(playerListFrame, "X", COLORS.red, COLORS.text, FONTS.header, 16)
+local playerListClose = Instance.new("TextButton")
+playerListClose.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+playerListClose.TextColor3 = Color3.fromRGB(240, 240, 240)
+playerListClose.Text = "X"
+playerListClose.Font = Enum.Font.GothamSemibold
+playerListClose.TextSize = 16
 playerListClose.Size = UDim2.new(0, 30, 0, 30)
 playerListClose.Position = UDim2.new(1, -40, 0, 10)
+local corner3 = Instance.new("UICorner")
+corner3.CornerRadius = UDim.new(0, 6)
+corner3.Parent = playerListClose
+local stroke3 = Instance.new("UIStroke")
+stroke3.Color = Color3.new(0, 0, 0)
+stroke3.Thickness = 0
+stroke3.Parent = playerListClose
+playerListClose.Parent = playerListFrame
 
 local playerScrollFrame = Instance.new("ScrollingFrame")
 playerScrollFrame.Size = UDim2.new(1, -20, 1, -60)
@@ -434,7 +175,7 @@ playerScrollFrame.Position = UDim2.new(0, 10, 0, 50)
 playerScrollFrame.BackgroundTransparency = 1
 playerScrollFrame.BorderSizePixel = 0
 playerScrollFrame.ScrollBarThickness = 4
-playerScrollFrame.ScrollBarImageColor3 = COLORS.accent
+playerScrollFrame.ScrollBarImageColor3 = Color3.fromRGB(0, 170, 255)
 playerScrollFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
 playerScrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
 playerScrollFrame.Parent = playerListFrame
@@ -451,29 +192,48 @@ local requestPopupFrame = Instance.new("Frame")
 requestPopupFrame.Name = "RequestPopup"
 requestPopupFrame.Size = UDim2.new(0, 350, 0, 180)
 requestPopupFrame.Position = UDim2.new(0.5, -175, 0.5, -90)
-requestPopupFrame.BackgroundColor3 = COLORS.bg
+requestPopupFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
 requestPopupFrame.BorderSizePixel = 0
 requestPopupFrame.Visible = false
-addCorner(requestPopupFrame, 12)
-addStroke(requestPopupFrame, COLORS.accent, 2)
+local corner4 = Instance.new("UICorner")
+corner4.CornerRadius = UDim.new(0, 12)
+corner4.Parent = requestPopupFrame
+local stroke4 = Instance.new("UIStroke")
+stroke4.Color = Color3.fromRGB(0, 170, 255)
+stroke4.Thickness = 2
+stroke4.Parent = requestPopupFrame
 requestPopupFrame.Parent = screenGui
 
-local requestTitle = makeLabel(requestPopupFrame, "Trade Request!", FONTS.title, 20, COLORS.accent)
+local requestTitle = Instance.new("TextLabel")
+requestTitle.BackgroundTransparency = 1
+requestTitle.Text = "Trade Request!"
+requestTitle.Font = Enum.Font.GothamBold
+requestTitle.TextSize = 20
+requestTitle.TextColor3 = Color3.fromRGB(0, 170, 255)
 requestTitle.Size = UDim2.new(1, 0, 0, 35)
 requestTitle.Position = UDim2.new(0, 0, 0, 10)
 requestTitle.TextXAlignment = Enum.TextXAlignment.Center
+requestTitle.Parent = requestPopupFrame
 
-local requestNameLabel = makeLabel(requestPopupFrame, "", FONTS.body, 16, COLORS.text)
+local requestNameLabel = Instance.new("TextLabel")
+requestNameLabel.BackgroundTransparency = 1
+requestNameLabel.Text = ""
+requestNameLabel.Font = Enum.Font.Gotham
+requestNameLabel.TextSize = 16
+requestNameLabel.TextColor3 = Color3.fromRGB(240, 240, 240)
 requestNameLabel.Size = UDim2.new(1, 0, 0, 25)
 requestNameLabel.Position = UDim2.new(0, 0, 0, 50)
 requestNameLabel.TextXAlignment = Enum.TextXAlignment.Center
+requestNameLabel.Parent = requestPopupFrame
 
 local requestTimerBar = Instance.new("Frame")
 requestTimerBar.Size = UDim2.new(0.8, 0, 0, 4)
 requestTimerBar.Position = UDim2.new(0.1, 0, 0, 85)
-requestTimerBar.BackgroundColor3 = COLORS.accent
+requestTimerBar.BackgroundColor3 = Color3.fromRGB(0, 170, 255)
 requestTimerBar.BorderSizePixel = 0
-addCorner(requestTimerBar, 2)
+local corner5 = Instance.new("UICorner")
+corner5.CornerRadius = UDim.new(0, 2)
+corner5.Parent = requestTimerBar
 requestTimerBar.Parent = requestPopupFrame
 
 local requestBtnFrame = Instance.new("Frame")
@@ -482,13 +242,39 @@ requestBtnFrame.Position = UDim2.new(0.1, 0, 1, -55)
 requestBtnFrame.BackgroundTransparency = 1
 requestBtnFrame.Parent = requestPopupFrame
 
-local acceptBtn = makeButton(requestBtnFrame, "Accept", COLORS.green, COLORS.text, FONTS.header, 16)
+local acceptBtn = Instance.new("TextButton")
+acceptBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 80)
+acceptBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
+acceptBtn.Text = "Accept"
+acceptBtn.Font = Enum.Font.GothamSemibold
+acceptBtn.TextSize = 16
 acceptBtn.Size = UDim2.new(0.48, 0, 1, 0)
 acceptBtn.Position = UDim2.new(0, 0, 0, 0)
+local corner6 = Instance.new("UICorner")
+corner6.CornerRadius = UDim.new(0, 6)
+corner6.Parent = acceptBtn
+local stroke6 = Instance.new("UIStroke")
+stroke6.Color = Color3.new(0, 0, 0)
+stroke6.Thickness = 0
+stroke6.Parent = acceptBtn
+acceptBtn.Parent = requestBtnFrame
 
-local declineBtn = makeButton(requestBtnFrame, "Decline", COLORS.red, COLORS.text, FONTS.header, 16)
+local declineBtn = Instance.new("TextButton")
+declineBtn.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+declineBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
+declineBtn.Text = "Decline"
+declineBtn.Font = Enum.Font.GothamSemibold
+declineBtn.TextSize = 16
 declineBtn.Size = UDim2.new(0.48, 0, 1, 0)
 declineBtn.Position = UDim2.new(0.52, 0, 0, 0)
+local corner7 = Instance.new("UICorner")
+corner7.CornerRadius = UDim.new(0, 6)
+corner7.Parent = declineBtn
+local stroke7 = Instance.new("UIStroke")
+stroke7.Color = Color3.new(0, 0, 0)
+stroke7.Thickness = 0
+stroke7.Parent = declineBtn
+declineBtn.Parent = requestBtnFrame
 
 -- ============================================================
 -- PHASE 3-6: TRADE WINDOW
@@ -497,28 +283,54 @@ local tradeWindow = Instance.new("Frame")
 tradeWindow.Name = "TradeWindow"
 tradeWindow.Size = UDim2.new(0, 700, 0, 500)
 tradeWindow.Position = UDim2.new(0.5, -350, 0.5, -250)
-tradeWindow.BackgroundColor3 = COLORS.bg
+tradeWindow.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
 tradeWindow.BorderSizePixel = 0
 tradeWindow.Visible = false
-addCorner(tradeWindow, 12)
-addStroke(tradeWindow, COLORS.border, 2)
+local corner8 = Instance.new("UICorner")
+corner8.CornerRadius = UDim.new(0, 12)
+corner8.Parent = tradeWindow
+local stroke8 = Instance.new("UIStroke")
+stroke8.Color = Color3.fromRGB(60, 60, 70)
+stroke8.Thickness = 2
+stroke8.Parent = tradeWindow
 tradeWindow.Parent = screenGui
 
 -- Title bar
 local tradeTitleBar = Instance.new("Frame")
 tradeTitleBar.Size = UDim2.new(1, 0, 0, 45)
-tradeTitleBar.BackgroundColor3 = COLORS.bgDark
+tradeTitleBar.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
 tradeTitleBar.BorderSizePixel = 0
-addCorner(tradeTitleBar, 12)
+local corner9 = Instance.new("UICorner")
+corner9.CornerRadius = UDim.new(0, 12)
+corner9.Parent = tradeTitleBar
 tradeTitleBar.Parent = tradeWindow
 
-local tradeTitleLabel = makeLabel(tradeTitleBar, "Trading with ...", FONTS.title, 16, COLORS.text)
+local tradeTitleLabel = Instance.new("TextLabel")
+tradeTitleLabel.BackgroundTransparency = 1
+tradeTitleLabel.Text = "Trading with ..."
+tradeTitleLabel.Font = Enum.Font.GothamBold
+tradeTitleLabel.TextSize = 16
+tradeTitleLabel.TextColor3 = Color3.fromRGB(240, 240, 240)
 tradeTitleLabel.Size = UDim2.new(1, -80, 1, 0)
 tradeTitleLabel.Position = UDim2.new(0, 15, 0, 0)
+tradeTitleLabel.Parent = tradeTitleBar
 
-local tradeCloseBtn = makeButton(tradeTitleBar, "Cancel", COLORS.red, COLORS.text, FONTS.header, 13)
+local tradeCloseBtn = Instance.new("TextButton")
+tradeCloseBtn.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+tradeCloseBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
+tradeCloseBtn.Text = "Cancel"
+tradeCloseBtn.Font = Enum.Font.GothamSemibold
+tradeCloseBtn.TextSize = 13
 tradeCloseBtn.Size = UDim2.new(0, 70, 0, 28)
 tradeCloseBtn.Position = UDim2.new(1, -80, 0.5, -14)
+local corner10 = Instance.new("UICorner")
+corner10.CornerRadius = UDim.new(0, 6)
+corner10.Parent = tradeCloseBtn
+local stroke10 = Instance.new("UIStroke")
+stroke10.Color = Color3.new(0, 0, 0)
+stroke10.Thickness = 0
+stroke10.Parent = tradeCloseBtn
+tradeCloseBtn.Parent = tradeTitleBar
 
 -- Content area
 local tradeContent = Instance.new("Frame")
@@ -532,15 +344,26 @@ local inventoryPanel = Instance.new("Frame")
 inventoryPanel.Name = "InventoryPanel"
 inventoryPanel.Size = UDim2.new(0.3, -5, 1, -60)
 inventoryPanel.Position = UDim2.new(0, 10, 0, 5)
-inventoryPanel.BackgroundColor3 = COLORS.bgLight
+inventoryPanel.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
 inventoryPanel.BorderSizePixel = 0
-addCorner(inventoryPanel, 8)
-addStroke(inventoryPanel, COLORS.border, 1)
+local corner11 = Instance.new("UICorner")
+corner11.CornerRadius = UDim.new(0, 8)
+corner11.Parent = inventoryPanel
+local stroke11 = Instance.new("UIStroke")
+stroke11.Color = Color3.fromRGB(60, 60, 70)
+stroke11.Thickness = 1
+stroke11.Parent = inventoryPanel
 inventoryPanel.Parent = tradeContent
 
-local inventoryTitle = makeLabel(inventoryPanel, "My Licenses", FONTS.header, 14, COLORS.accent)
+local inventoryTitle = Instance.new("TextLabel")
+inventoryTitle.BackgroundTransparency = 1
+inventoryTitle.Text = "My Licenses"
+inventoryTitle.Font = Enum.Font.GothamSemibold
+inventoryTitle.TextSize = 14
+inventoryTitle.TextColor3 = Color3.fromRGB(0, 170, 255)
 inventoryTitle.Size = UDim2.new(1, 0, 0, 30)
 inventoryTitle.Position = UDim2.new(0, 10, 0, 5)
+inventoryTitle.Parent = inventoryPanel
 
 local inventoryScroll = Instance.new("ScrollingFrame")
 inventoryScroll.Size = UDim2.new(1, -10, 1, -40)
@@ -548,7 +371,7 @@ inventoryScroll.Position = UDim2.new(0, 5, 0, 35)
 inventoryScroll.BackgroundTransparency = 1
 inventoryScroll.BorderSizePixel = 0
 inventoryScroll.ScrollBarThickness = 4
-inventoryScroll.ScrollBarImageColor3 = COLORS.accent
+inventoryScroll.ScrollBarImageColor3 = Color3.fromRGB(0, 170, 255)
 inventoryScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 inventoryScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 inventoryScroll.Parent = inventoryPanel
@@ -570,15 +393,26 @@ local myOfferFrame = Instance.new("Frame")
 myOfferFrame.Name = "MyOfferFrame"
 myOfferFrame.Size = UDim2.new(1, 0, 0.48, -5)
 myOfferFrame.Position = UDim2.new(0, 0, 0, 0)
-myOfferFrame.BackgroundColor3 = COLORS.bgLight
+myOfferFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
 myOfferFrame.BorderSizePixel = 0
-addCorner(myOfferFrame, 8)
-addStroke(myOfferFrame, COLORS.border, 1)
+local corner12 = Instance.new("UICorner")
+corner12.CornerRadius = UDim.new(0, 8)
+corner12.Parent = myOfferFrame
+local stroke12 = Instance.new("UIStroke")
+stroke12.Color = Color3.fromRGB(60, 60, 70)
+stroke12.Thickness = 1
+stroke12.Parent = myOfferFrame
 myOfferFrame.Parent = offersPanel
 
-local myOfferTitle = makeLabel(myOfferFrame, "Your Offer (0)", FONTS.header, 13, COLORS.green)
+local myOfferTitle = Instance.new("TextLabel")
+myOfferTitle.BackgroundTransparency = 1
+myOfferTitle.Text = "Your Offer (0)"
+myOfferTitle.Font = Enum.Font.GothamSemibold
+myOfferTitle.TextSize = 13
+myOfferTitle.TextColor3 = Color3.fromRGB(0, 200, 80)
 myOfferTitle.Size = UDim2.new(1, 0, 0, 25)
 myOfferTitle.Position = UDim2.new(0, 10, 0, 3)
+myOfferTitle.Parent = myOfferFrame
 
 local myOfferScroll = Instance.new("ScrollingFrame")
 myOfferScroll.Size = UDim2.new(1, -10, 1, -30)
@@ -586,7 +420,7 @@ myOfferScroll.Position = UDim2.new(0, 5, 0, 28)
 myOfferScroll.BackgroundTransparency = 1
 myOfferScroll.BorderSizePixel = 0
 myOfferScroll.ScrollBarThickness = 3
-myOfferScroll.ScrollBarImageColor3 = COLORS.accent
+myOfferScroll.ScrollBarImageColor3 = Color3.fromRGB(0, 170, 255)
 myOfferScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 myOfferScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 myOfferScroll.Parent = myOfferFrame
@@ -603,24 +437,41 @@ arrowFrame.Position = UDim2.new(0, 0, 0.48, -5)
 arrowFrame.BackgroundTransparency = 1
 arrowFrame.Parent = offersPanel
 
-local arrowLabel = makeLabel(arrowFrame, "\226\135\133", FONTS.title, 18, COLORS.textDim)
+local arrowLabel = Instance.new("TextLabel")
+arrowLabel.BackgroundTransparency = 1
+arrowLabel.Text = "⇓"
+arrowLabel.Font = Enum.Font.GothamBold
+arrowLabel.TextSize = 18
+arrowLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
 arrowLabel.Size = UDim2.new(1, 0, 1, 0)
 arrowLabel.TextXAlignment = Enum.TextXAlignment.Center
+arrowLabel.Parent = arrowFrame
 
 -- Their Offer
 local theirOfferFrame = Instance.new("Frame")
 theirOfferFrame.Name = "TheirOfferFrame"
 theirOfferFrame.Size = UDim2.new(1, 0, 0.48, -5)
 theirOfferFrame.Position = UDim2.new(0, 0, 0.52, 5)
-theirOfferFrame.BackgroundColor3 = COLORS.bgLight
+theirOfferFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
 theirOfferFrame.BorderSizePixel = 0
-addCorner(theirOfferFrame, 8)
-addStroke(theirOfferFrame, COLORS.border, 1)
+local corner13 = Instance.new("UICorner")
+corner13.CornerRadius = UDim.new(0, 8)
+corner13.Parent = theirOfferFrame
+local stroke13 = Instance.new("UIStroke")
+stroke13.Color = Color3.fromRGB(60, 60, 70)
+stroke13.Thickness = 1
+stroke13.Parent = theirOfferFrame
 theirOfferFrame.Parent = offersPanel
 
-local theirOfferTitle = makeLabel(theirOfferFrame, "Their Offer (0)", FONTS.header, 13, COLORS.yellow)
+local theirOfferTitle = Instance.new("TextLabel")
+theirOfferTitle.BackgroundTransparency = 1
+theirOfferTitle.Text = "Their Offer (0)"
+theirOfferTitle.Font = Enum.Font.GothamSemibold
+theirOfferTitle.TextSize = 13
+theirOfferTitle.TextColor3 = Color3.fromRGB(255, 200, 0)
 theirOfferTitle.Size = UDim2.new(1, 0, 0, 25)
 theirOfferTitle.Position = UDim2.new(0, 10, 0, 3)
+theirOfferTitle.Parent = theirOfferFrame
 
 local theirOfferScroll = Instance.new("ScrollingFrame")
 theirOfferScroll.Size = UDim2.new(1, -10, 1, -30)
@@ -628,7 +479,7 @@ theirOfferScroll.Position = UDim2.new(0, 5, 0, 28)
 theirOfferScroll.BackgroundTransparency = 1
 theirOfferScroll.BorderSizePixel = 0
 theirOfferScroll.ScrollBarThickness = 3
-theirOfferScroll.ScrollBarImageColor3 = COLORS.accent
+theirOfferScroll.ScrollBarImageColor3 = Color3.fromRGB(0, 170, 255)
 theirOfferScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 theirOfferScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 theirOfferScroll.Parent = theirOfferFrame
@@ -643,44 +494,85 @@ local statusPanel = Instance.new("Frame")
 statusPanel.Name = "StatusPanel"
 statusPanel.Size = UDim2.new(0.3, -5, 1, -60)
 statusPanel.Position = UDim2.new(0.7, 5, 0, 5)
-statusPanel.BackgroundColor3 = COLORS.bgLight
+statusPanel.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
 statusPanel.BorderSizePixel = 0
-addCorner(statusPanel, 8)
-addStroke(statusPanel, COLORS.border, 1)
+local corner14 = Instance.new("UICorner")
+corner14.CornerRadius = UDim.new(0, 8)
+corner14.Parent = statusPanel
+local stroke14 = Instance.new("UIStroke")
+stroke14.Color = Color3.fromRGB(60, 60, 70)
+stroke14.Thickness = 1
+stroke14.Parent = statusPanel
 statusPanel.Parent = tradeContent
 
-local statusTitle = makeLabel(statusPanel, "Trade Status", FONTS.header, 14, COLORS.accent)
+local statusTitle = Instance.new("TextLabel")
+statusTitle.BackgroundTransparency = 1
+statusTitle.Text = "Trade Status"
+statusTitle.Font = Enum.Font.GothamSemibold
+statusTitle.TextSize = 14
+statusTitle.TextColor3 = Color3.fromRGB(0, 170, 255)
 statusTitle.Size = UDim2.new(1, 0, 0, 30)
 statusTitle.Position = UDim2.new(0, 10, 0, 5)
+statusTitle.Parent = statusPanel
 
-local myReadyLabel = makeLabel(statusPanel, "\226\151\139 You: Not Ready", FONTS.body, 13, COLORS.textDim)
+local myReadyLabel = Instance.new("TextLabel")
+myReadyLabel.BackgroundTransparency = 1
+myReadyLabel.Text = "✹ You: Not Ready"
+myReadyLabel.Font = Enum.Font.Gotham
+myReadyLabel.TextSize = 13
+myReadyLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
 myReadyLabel.Size = UDim2.new(1, -20, 0, 22)
 myReadyLabel.Position = UDim2.new(0, 10, 0, 40)
+myReadyLabel.Parent = statusPanel
 
-local theirReadyLabel = makeLabel(statusPanel, "\226\151\139 Partner: Not Ready", FONTS.body, 13, COLORS.textDim)
+local theirReadyLabel = Instance.new("TextLabel")
+theirReadyLabel.BackgroundTransparency = 1
+theirReadyLabel.Text = "✹ Partner: Not Ready"
+theirReadyLabel.Font = Enum.Font.Gotham
+theirReadyLabel.TextSize = 13
+theirReadyLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
 theirReadyLabel.Size = UDim2.new(1, -20, 0, 22)
 theirReadyLabel.Position = UDim2.new(0, 10, 0, 65)
+theirReadyLabel.Parent = statusPanel
 
 local divider1 = Instance.new("Frame")
 divider1.Size = UDim2.new(0.8, 0, 0, 1)
 divider1.Position = UDim2.new(0.1, 0, 0, 92)
-divider1.BackgroundColor3 = COLORS.border
+divider1.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
 divider1.BorderSizePixel = 0
 divider1.Parent = statusPanel
 
-local myConfirmLabel = makeLabel(statusPanel, "\226\151\139 You: Not Confirmed", FONTS.body, 13, COLORS.textDim)
+local myConfirmLabel = Instance.new("TextLabel")
+myConfirmLabel.BackgroundTransparency = 1
+myConfirmLabel.Text = "✹ You: Not Confirmed"
+myConfirmLabel.Font = Enum.Font.Gotham
+myConfirmLabel.TextSize = 13
+myConfirmLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
 myConfirmLabel.Size = UDim2.new(1, -20, 0, 22)
 myConfirmLabel.Position = UDim2.new(0, 10, 0, 100)
+myConfirmLabel.Parent = statusPanel
 
-local theirConfirmLabel = makeLabel(statusPanel, "\226\151\139 Partner: Not Confirmed", FONTS.body, 13, COLORS.textDim)
+local theirConfirmLabel = Instance.new("TextLabel")
+theirConfirmLabel.BackgroundTransparency = 1
+theirConfirmLabel.Text = "✹ Partner: Not Confirmed"
+theirConfirmLabel.Font = Enum.Font.Gotham
+theirConfirmLabel.TextSize = 13
+theirConfirmLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
 theirConfirmLabel.Size = UDim2.new(1, -20, 0, 22)
 theirConfirmLabel.Position = UDim2.new(0, 10, 0, 125)
+theirConfirmLabel.Parent = statusPanel
 
-local warningLabel = makeLabel(statusPanel, "", FONTS.small, 11, COLORS.yellow)
+local warningLabel = Instance.new("TextLabel")
+warningLabel.BackgroundTransparency = 1
+warningLabel.Text = ""
+warningLabel.Font = Enum.Font.GothamMedium
+warningLabel.TextSize = 11
+warningLabel.TextColor3 = Color3.fromRGB(255, 200, 0)
 warningLabel.Size = UDim2.new(1, -20, 0, 50)
 warningLabel.Position = UDim2.new(0, 10, 0, 155)
 warningLabel.TextWrapped = true
 warningLabel.Visible = false
+warningLabel.Parent = statusPanel
 
 -- BOTTOM: Action Buttons (Phase 6)
 local actionFrame = Instance.new("Frame")
@@ -689,19 +581,58 @@ actionFrame.Position = UDim2.new(0, 10, 1, -55)
 actionFrame.BackgroundTransparency = 1
 actionFrame.Parent = tradeWindow
 
-local readyBtn = makeButton(actionFrame, "Ready Up", COLORS.green, COLORS.text, FONTS.header, 15)
+local readyBtn = Instance.new("TextButton")
+readyBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 80)
+readyBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
+readyBtn.Text = "Ready Up"
+readyBtn.Font = Enum.Font.GothamSemibold
+readyBtn.TextSize = 15
 readyBtn.Size = UDim2.new(0.3, -5, 1, 0)
 readyBtn.Position = UDim2.new(0.02, 0, 0, 0)
+local corner15 = Instance.new("UICorner")
+corner15.CornerRadius = UDim.new(0, 6)
+corner15.Parent = readyBtn
+local stroke15 = Instance.new("UIStroke")
+stroke15.Color = Color3.new(0, 0, 0)
+stroke15.Thickness = 0
+stroke15.Parent = readyBtn
+readyBtn.Parent = actionFrame
 
-local unreadyBtn = makeButton(actionFrame, "Unready", COLORS.yellow, Color3.fromRGB(30, 30, 35), FONTS.header, 15)
+local unreadyBtn = Instance.new("TextButton")
+unreadyBtn.BackgroundColor3 = Color3.fromRGB(255, 200, 0)
+unreadyBtn.TextColor3 = Color3.fromRGB(30, 30, 35)
+unreadyBtn.Text = "Unready"
+unreadyBtn.Font = Enum.Font.GothamSemibold
+unreadyBtn.TextSize = 15
 unreadyBtn.Size = UDim2.new(0.3, -5, 1, 0)
 unreadyBtn.Position = UDim2.new(0.02, 0, 0, 0)
 unreadyBtn.Visible = false
+local corner16 = Instance.new("UICorner")
+corner16.CornerRadius = UDim.new(0, 6)
+corner16.Parent = unreadyBtn
+local stroke16 = Instance.new("UIStroke")
+stroke16.Color = Color3.new(0, 0, 0)
+stroke16.Thickness = 0
+stroke16.Parent = unreadyBtn
+unreadyBtn.Parent = actionFrame
 
-local confirmBtn = makeButton(actionFrame, "Confirm Trade", COLORS.gold, Color3.fromRGB(30, 30, 35), FONTS.header, 15)
+local confirmBtn = Instance.new("TextButton")
+confirmBtn.BackgroundColor3 = Color3.fromRGB(255, 215, 0)
+confirmBtn.TextColor3 = Color3.fromRGB(30, 30, 35)
+confirmBtn.Text = "Confirm Trade"
+confirmBtn.Font = Enum.Font.GothamSemibold
+confirmBtn.TextSize = 15
 confirmBtn.Size = UDim2.new(0.3, -5, 1, 0)
 confirmBtn.Position = UDim2.new(0.35, 0, 0, 0)
 confirmBtn.Visible = false
+local corner17 = Instance.new("UICorner")
+corner17.CornerRadius = UDim.new(0, 6)
+corner17.Parent = confirmBtn
+local stroke17 = Instance.new("UIStroke")
+stroke17.Color = Color3.new(0, 0, 0)
+stroke17.Thickness = 0
+stroke17.Parent = confirmBtn
+confirmBtn.Parent = actionFrame
 
 -- ============================================================
 -- PHASE 7: SUCCESS SCREEN
@@ -710,22 +641,39 @@ local successFrame = Instance.new("Frame")
 successFrame.Name = "SuccessFrame"
 successFrame.Size = UDim2.new(0, 400, 0, 300)
 successFrame.Position = UDim2.new(0.5, -200, 0.5, -150)
-successFrame.BackgroundColor3 = COLORS.bg
+successFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
 successFrame.BorderSizePixel = 0
 successFrame.Visible = false
-addCorner(successFrame, 12)
-addStroke(successFrame, COLORS.success, 2)
+local corner18 = Instance.new("UICorner")
+corner18.CornerRadius = UDim.new(0, 12)
+corner18.Parent = successFrame
+local stroke18 = Instance.new("UIStroke")
+stroke18.Color = Color3.fromRGB(50, 205, 50)
+stroke18.Thickness = 2
+stroke18.Parent = successFrame
 successFrame.Parent = screenGui
 
-local successTitle = makeLabel(successFrame, "Trade Complete!", FONTS.title, 24, COLORS.success)
+local successTitle = Instance.new("TextLabel")
+successTitle.BackgroundTransparency = 1
+successTitle.Text = "Trade Complete!"
+successTitle.Font = Enum.Font.GothamBold
+successTitle.TextSize = 24
+successTitle.TextColor3 = Color3.fromRGB(50, 205, 50)
 successTitle.Size = UDim2.new(1, 0, 0, 40)
 successTitle.Position = UDim2.new(0, 0, 0, 15)
 successTitle.TextXAlignment = Enum.TextXAlignment.Center
+successTitle.Parent = successFrame
 
-local successSubtitle = makeLabel(successFrame, "You received:", FONTS.body, 14, COLORS.textDim)
+local successSubtitle = Instance.new("TextLabel")
+successSubtitle.BackgroundTransparency = 1
+successSubtitle.Text = "You received:"
+successSubtitle.Font = Enum.Font.Gotham
+successSubtitle.TextSize = 14
+successSubtitle.TextColor3 = Color3.fromRGB(160, 160, 170)
 successSubtitle.Size = UDim2.new(1, 0, 0, 20)
 successSubtitle.Position = UDim2.new(0, 0, 0, 55)
 successSubtitle.TextXAlignment = Enum.TextXAlignment.Center
+successSubtitle.Parent = successFrame
 
 local successScroll = Instance.new("ScrollingFrame")
 successScroll.Size = UDim2.new(0.9, 0, 0, 150)
@@ -733,7 +681,7 @@ successScroll.Position = UDim2.new(0.05, 0, 0, 80)
 successScroll.BackgroundTransparency = 1
 successScroll.BorderSizePixel = 0
 successScroll.ScrollBarThickness = 4
-successScroll.ScrollBarImageColor3 = COLORS.accent
+successScroll.ScrollBarImageColor3 = Color3.fromRGB(0, 170, 255)
 successScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 successScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 successScroll.Parent = successFrame
@@ -743,1069 +691,414 @@ successListLayout.SortOrder = Enum.SortOrder.LayoutOrder
 successListLayout.Padding = UDim.new(0, 4)
 successListLayout.Parent = successScroll
 
-local successCloseBtn = makeButton(successFrame, "Close", COLORS.accent, COLORS.text, FONTS.header, 14)
+local successCloseBtn = Instance.new("TextButton")
+successCloseBtn.BackgroundColor3 = Color3.fromRGB(0, 170, 255)
+successCloseBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
+successCloseBtn.Text = "Close"
+successCloseBtn.Font = Enum.Font.GothamSemibold
+successCloseBtn.TextSize = 14
 successCloseBtn.Size = UDim2.new(0.5, 0, 0, 36)
 successCloseBtn.Position = UDim2.new(0.25, 0, 1, -50)
+local corner19 = Instance.new("UICorner")
+corner19.CornerRadius = UDim.new(0, 6)
+corner19.Parent = successCloseBtn
+local stroke19 = Instance.new("UIStroke")
+stroke19.Color = Color3.new(0, 0, 0)
+stroke19.Thickness = 0
+stroke19.Parent = successCloseBtn
+successCloseBtn.Parent = successFrame
 
 -- ============================================================
--- TOAST NOTIFICATION
+-- UI INSTANCES  [VERIFIED constructor signatures]
 -- ============================================================
-local toastFrame = Instance.new("Frame")
-toastFrame.Name = "ToastFrame"
-toastFrame.Size = UDim2.new(0, 320, 0, 50)
-toastFrame.Position = UDim2.new(0.5, -160, 0, 20)
-toastFrame.BackgroundColor3 = COLORS.bgDark
-toastFrame.BorderSizePixel = 0
-toastFrame.Visible = false
-addCorner(toastFrame, 8)
-addStroke(toastFrame, COLORS.accent, 1)
-toastFrame.Parent = screenGui
-
-local toastLabel = makeLabel(toastFrame, "", FONTS.body, 13, COLORS.text)
-toastLabel.Size = UDim2.new(1, -20, 1, 0)
-toastLabel.Position = UDim2.new(0, 10, 0, 0)
-toastLabel.TextXAlignment = Enum.TextXAlignment.Center
-
--- ============================================================
--- TOAST LOGIC
--- ============================================================
-local toastQueue = {}
-local toastBusy = false
-
-local function processToastQueue()
-	toastBusy = true
-	while #toastQueue > 0 do
-		local msg = table.remove(toastQueue, 1)
-		toastLabel.Text = msg
-		toastFrame.Visible = true
-		toastFrame.BackgroundTransparency = 1
-		local fadeIn = TweenService:Create(toastFrame, TweenInfo.new(0.3), {BackgroundTransparency = 0})
-		fadeIn:Play()
-		-- Don't track fadeIn - it completes quickly
-		task.wait(3)
-		local fadeOut = TweenService:Create(toastFrame, TweenInfo.new(0.3), {BackgroundTransparency = 1})
-		fadeOut:Play()
-		fadeOut.Completed:Wait()
-		toastFrame.Visible = false
-		task.wait(0.1)
-	end
-	toastBusy = false
-end
-
-local function showToast(message)
-	table.insert(toastQueue, message)
-	if not toastBusy then
-		task.spawn(processToastQueue)
-	end
-end
+local inventoryUI = InventoryUI.new(inventoryScroll)
+local offerUI = OfferUI.new(myOfferScroll, theirOfferScroll)
+local statusUI = StatusUI.new({
+	myReady = myReadyLabel,
+	theirReady = theirReadyLabel,
+	myConfirm = myConfirmLabel,
+	theirConfirm = theirConfirmLabel,
+	warning = warningLabel,
+})
+local successUI = SuccessUI.new(successFrame, successScroll)
+local toastUI = ToastUI.new(screenGui)
+local tradeWindowUI = TradeWindowUI.new({
+	playerList = playerListFrame,
+	requestPopup = requestPopupFrame,
+	tradeWindow = tradeWindow,
+	success = successFrame,
+})
+local playerListUI = PlayerListUI.new(playerScrollFrame)
 
 -- ============================================================
--- BUTTON STATE MANAGEMENT
+-- CONTROLLER INSTANCES  [VERIFIED constructor signatures]
 -- ============================================================
-local function setAllButtonsEnabled(enabled)
-	setButtonEnabled(readyBtn, enabled)
-	setButtonEnabled(unreadyBtn, enabled)
-	setButtonEnabled(confirmBtn, enabled)
-	setButtonEnabled(tradeCloseBtn, enabled)
-end
+local notificationController = NotificationController.new(toastUI)
+local successController = SuccessController.new(successUI)
+local statusController = StatusController.new(statusUI)
 
-local function resetButtonStates()
-	state.buttonStates = {
-		ready = false,
-		unready = false,
-		confirm = false,
-		cancel = false,
-		retryLicenses = false,
-	}
-	-- Cancel any pending button timeouts
-	for buttonName, task in pairs(buttonTimeoutTasks) do
-		if task then
-			task.cancel(task)
-			buttonTimeoutTasks[buttonName] = nil
-		end
-	end
-end
+local tradeControllerDeps = {
+	remotes = remotes,
+	config = CONFIG,
+	httpService = HttpService,
+	frames = {
+		tradeWindow = tradeWindow,
+		requestPopupFrame = requestPopupFrame,
+		successFrame = successFrame,
+		readyBtn = readyBtn,
+		unreadyBtn = unreadyBtn,
+		confirmBtn = confirmBtn,
+		tradeCloseBtn = tradeCloseBtn,
+		inventoryPanel = inventoryPanel,
+		inventoryScroll = inventoryScroll,
+	},
+	state = state,
+	notificationController = notificationController,
+	statusController = statusController,
+	playerListUI = playerListUI,
+	inventoryController = nil,
+	offerController = nil,
+}
+
+local tradeController = TradeController.new(tradeControllerDeps)
+
+local sharedDeps = {
+	TradeState = TradeState,
+	state = state,
+	notificationController = notificationController,
+	resetReadyState = function() tradeController:ResetReadyState() end,
+	tradeUpdateRE = remotes.tradeUpdate,
+}
+
+local inventoryController = InventoryController.new(inventoryUI, sharedDeps)
+local offerController = OfferController.new(offerUI, sharedDeps)
+
+tradeControllerDeps.inventoryController = inventoryController
+tradeControllerDeps.offerController = offerController
 
 -- ============================================================
--- PHASE 1: PLAYER LIST LOGIC
+-- REMOTE EVENT HANDLERS
 -- ============================================================
--- Player list incremental management
-local playerEntries = {} -- Maps userId to entry Frame
 
--- Inventory entry tracking for diff-based updates
-local inventoryEntries = {} -- Maps licenseId to entry Frame
-
--- Offer entry tracking for diff-based updates
-local myOfferEntries = {} -- Maps licenseId to entry Frame
-local theirOfferEntries = {} -- Maps licenseId to entry Frame
-
-local function refreshPlayerList()
-	-- Disconnect all temporary connections from previous player list entries
-	disconnectPlayerListConnections()
-	
-	-- Clear only disconnected entries
-	for userId, entry in pairs(playerEntries) do
-		if not entry.Parent then
-			playerEntries[userId] = nil
-		end
+-- Trade started (Phase 3)
+remotes.tradeStarted.OnClientEvent:Connect(function(data)
+	if not data or not data.tradeId or not data.partnerName then
+		warn("[TradeClient] Invalid trade started data")
+		return
 	end
 	
-	-- Get current players
-	local currentPlayers = {}
-	for _, p in Players:GetPlayers() do
-		if p ~= player then
-			currentPlayers[p.UserId] = p
-		end
+	if state.currentTradeId then
+		warn("[TradeClient] Ignoring trade start - already in trade")
+		return
 	end
 	
-	-- Remove entries for players who left
-	for userId, entry in pairs(playerEntries) do
-		if not currentPlayers[userId] then
-			entry:Destroy()
-			playerEntries[userId] = nil
-		end
+	state.currentTradeId = data.tradeId
+	state.partnerName = data.partnerName
+	state.partnerId = data.partnerId
+
+	if TradeState.Set(TradeState.Trading) then
+		tradeTitleLabel.Text = "Trading with " .. data.partnerName
+		tradeWindowUI:ShowTradeWindow()
+		tradeController.CurrentFetchRequestId = tradeController:FetchLicenses()
+	end
+end)
+
+-- Trade update (state changes, Phase 5-6)
+remotes.tradeUpdate.OnClientEvent:Connect(function(data)
+	if not data or not data.tradeId then
+		warn("[TradeClient] Invalid trade update data")
+		return
 	end
 	
-	-- Add entries for new players
-	for userId, p in pairs(currentPlayers) do
-		if not playerEntries[userId] then
-			local entry = Instance.new("Frame")
-			entry.Size = UDim2.new(1, 0, 0, 40)
-			entry.BackgroundColor3 = COLORS.bgDark
-			entry.BorderSizePixel = 0
-			addCorner(entry, 6)
-			entry.Parent = playerScrollFrame
-			
-			local nameLabel = makeLabel(entry, p.Name, FONTS.body, 14, COLORS.text)
-			nameLabel.Size = UDim2.new(0.6, 0, 1, 0)
-			nameLabel.Position = UDim2.new(0, 10, 0, 0)
-
-			local tradeBtn = makeButton(entry, "Trade", COLORS.accent, COLORS.text, FONTS.small, 12)
-			tradeBtn.Size = UDim2.new(0, 60, 0, 28)
-			tradeBtn.Position = UDim2.new(1, -70, 0.5, -14)
-
-			-- Store targetUserId as attribute to prevent wrong player selection
-			tradeBtn:SetAttribute("TargetUserId", p.UserId)
-
-			local conn = tradeBtn.MouseButton1Click:Connect(function()
-				if state.currentTradeId then
-					showToast("You are already in a trade!")
-					return
-				end
-				local targetUserId = tradeBtn:GetAttribute("TargetUserId")
-				SendTradeRequestRE:FireServer({targetUserId = targetUserId})
-				showToast("Trade request sent to " .. p.Name)
-				playerListFrame.Visible = false
-			end)
-			table.insert(playerListConnections, conn)
-			
-			playerEntries[userId] = entry
-		end
-	end
+	if data.tradeId ~= state.currentTradeId then return end
 	
-	-- Show empty state if no players
-	if next(currentPlayers) == nil then
-		clearChildren(playerScrollFrame, "Frame")
-		local emptyLabel = makeLabel(playerScrollFrame, "No other players online", FONTS.body, 13, COLORS.textDim)
-		emptyLabel.Size = UDim2.new(1, 0, 0, 30)
-		emptyLabel.TextXAlignment = Enum.TextXAlignment.Center
-	end
-end
-
--- ============================================================
--- PHASE 4: INVENTORY LOGIC
--- ============================================================
--- Trade button state helper to centralize UI reset logic
-local function setTradeButtons(stateName)
-	if stateName == "idle" then
-		readyBtn.Visible = true
-		unreadyBtn.Visible = false
-		confirmBtn.Visible = false
-		warningLabel.Visible = false
-		-- Unlock inventory
-		inventoryPanel.BackgroundTransparency = 0
-		inventoryScroll.BackgroundTransparency = 1
-	elseif stateName == "ready" then
-		readyBtn.Visible = false
-		unreadyBtn.Visible = true
-		confirmBtn.Visible = false
-		warningLabel.Visible = false
-		-- Lock inventory
-		inventoryPanel.BackgroundTransparency = 0.5
-		inventoryScroll.BackgroundTransparency = 0.5
-	elseif stateName == "confirm" then
-		readyBtn.Visible = false
-		unreadyBtn.Visible = false
-		confirmBtn.Visible = false
-		warningLabel.Visible = true
-		-- Lock inventory
-		inventoryPanel.BackgroundTransparency = 0.5
-		inventoryScroll.BackgroundTransparency = 0.5
-	elseif stateName == "both_ready" then
-		readyBtn.Visible = false
-		unreadyBtn.Visible = true
-		confirmBtn.Visible = true
-		warningLabel.Visible = true
-		warningLabel.Text = "Both ready! Confirm to complete trade."
-		warningLabel.TextColor3 = COLORS.gold
-		-- Lock inventory
-		inventoryPanel.BackgroundTransparency = 0.5
-		inventoryScroll.BackgroundTransparency = 0.5
-	elseif stateName == "waiting_partner" then
-		readyBtn.Visible = false
-		unreadyBtn.Visible = true
-		confirmBtn.Visible = false
-		warningLabel.Visible = true
-		warningLabel.Text = "Waiting for partner to ready up..."
-		warningLabel.TextColor3 = COLORS.textDim
-		-- Lock inventory
-		inventoryPanel.BackgroundTransparency = 0.5
-		inventoryScroll.BackgroundTransparency = 0.5
-	elseif stateName == "waiting_confirm" then
-		readyBtn.Visible = false
-		unreadyBtn.Visible = false
-		confirmBtn.Visible = false
-		warningLabel.Visible = true
-		warningLabel.Text = "Waiting for partner to confirm..."
-		warningLabel.TextColor3 = COLORS.accent
-		-- Lock inventory
-		inventoryPanel.BackgroundTransparency = 0.5
-		inventoryScroll.BackgroundTransparency = 0.5
-	end
-end
-
-local function resetReadyState()
-	state.myReady = false
-	state.theirReady = false
-	state.myConfirmed = false
-	state.theirConfirmed = false
-
-	myReadyLabel.Text = "\226\151\139 You: Not Ready"
-	myReadyLabel.TextColor3 = COLORS.textDim
-	theirReadyLabel.Text = "\226\151\139 Partner: Not Ready"
-	theirReadyLabel.TextColor3 = COLORS.textDim
-	myConfirmLabel.Text = "\226\151\139 You: Not Confirmed"
-	myConfirmLabel.TextColor3 = COLORS.textDim
-	theirConfirmLabel.Text = "\226\151\139 Partner: Not Confirmed"
-	theirConfirmLabel.TextColor3 = COLORS.textDim
-
-	readyBtn.Visible = true
-	unreadyBtn.Visible = false
-	confirmBtn.Visible = false
-	warningLabel.Visible = false
-	
-	-- Unlock inventory
-	inventoryPanel.BackgroundTransparency = 0
-	inventoryScroll.BackgroundTransparency = 1
-end
-
--- Inventory UI helper functions
-local function showInventoryLoading()
-	local loadingContainer = Instance.new("Frame")
-	loadingContainer.Name = "LoadingContainer"
-	loadingContainer.Size = UDim2.new(1, 0, 0, 80)
-	loadingContainer.BackgroundTransparency = 1
-	loadingContainer.Parent = inventoryScroll
-
-	local spinner, animate, stop = createLoadingSpinner(loadingContainer)
-	animate()
-
-	local loadingLabel = makeLabel(loadingContainer, "Loading licenses...", FONTS.body, 13, COLORS.textDim)
-	loadingLabel.Size = UDim2.new(1, 0, 0, 20)
-	loadingLabel.Position = UDim2.new(0, 0, 1, -25)
-	loadingLabel.TextXAlignment = Enum.TextXAlignment.Center
-
-	local subLabel = makeLabel(loadingContainer, "This may take a few seconds.", FONTS.small, 11, COLORS.textDark)
-	subLabel.Size = UDim2.new(1, 0, 0, 16)
-	subLabel.Position = UDim2.new(0, 0, 1, -5)
-	subLabel.TextXAlignment = Enum.TextXAlignment.Center
-
-	loadingContainer.StopSpinner = stop
-end
-
-local function showInventoryRetry()
-	local retryLabel = makeLabel(inventoryScroll, "Retrying...", FONTS.body, 13, COLORS.yellow)
-	retryLabel.Size = UDim2.new(1, 0, 0, 30)
-	retryLabel.TextXAlignment = Enum.TextXAlignment.Center
-end
-
-local function showInventoryError()
-	local errorLabel = makeLabel(inventoryScroll, "Failed to load licenses", FONTS.body, 13, COLORS.red)
-	errorLabel.Size = UDim2.new(1, 0, 0, 30)
-	errorLabel.TextXAlignment = Enum.TextXAlignment.Center
-
-	local retryBtn = makeButton(inventoryScroll, "Retry", COLORS.accent, COLORS.text, FONTS.small, 12)
-	retryBtn.Size = UDim2.new(0.6, 0, 0, 30)
-	retryBtn.Position = UDim2.new(0.2, 0, 0, 35)
-
-	local conn = retryBtn.MouseButton1Click:Connect(function()
-		if state.buttonStates.retryLicenses then return end
-		state.buttonStates.retryLicenses = true
-		setButtonEnabled(retryBtn, false)
-		
-		if currentRetryTask then
-			task.cancel(currentRetryTask)
-			currentRetryTask = nil
+	if data.action == "Completed" then
+		tradeWindowUI:ShowSuccess()
+		successController:Show(data.receivedLicenses or {})
+		state.currentTradeId = nil
+		if TradeState.Set(TradeState.Completed) then
+			tradeController.CurrentFetchRequestId = tradeController:FetchLicenses()
 		end
-		
-		fetchLicenses()
-	end)
-	table.insert(temporaryConnections, conn)
-end
-
-local function buildInventoryEntries()
-	local offeredSet = {}
-	for _, licId in ipairs(state.myOffer) do
-		offeredSet[licId] = true
-	end
-
-	local NON_TRADEABLE = {TRANSFERRED = true, REVOKED = true, EXPIRED = true}
-
-	-- Track current licenses to remove stale entries
-	local currentLicenses = {}
-	for i, lic in ipairs(state.myLicenses) do
-		currentLicenses[lic.id] = true
-	end
-
-	-- Remove entries for licenses that no longer exist
-	for licId, entry in pairs(inventoryEntries) do
-		if not currentLicenses[licId] then
-			entry:Destroy()
-			inventoryEntries[licId] = nil
-		end
-	end
-
-	-- Update or create entries for current licenses
-	for i, lic in ipairs(state.myLicenses) do
-		if offeredSet[lic.id] then continue end
-		if NON_TRADEABLE[lic.status] then continue end
-
-		local entry = inventoryEntries[lic.id]
-		
-		if entry then
-			-- Update existing entry (status may have changed)
-			local statusLabel = entry:FindFirstChild("StatusLabel")
-			if statusLabel then
-				statusLabel.Text = lic.status
-			end
-		else
-			-- Create new entry
-			entry = Instance.new("Frame")
-			entry.Name = "LicenseEntry_" .. tostring(lic.id)
-			entry.Size = UDim2.new(1, 0, 0, 36)
-			entry.BackgroundColor3 = COLORS.bgDark
-			entry.BorderSizePixel = 0
-			addCorner(entry, 6)
-			entry.Parent = inventoryScroll
-			inventoryEntries[lic.id] = entry
-
-			local displayName = lic.displayName or lic.name or tostring(lic.id)
-			local nameLabel = makeLabel(entry, displayName, FONTS.small, 12, COLORS.text)
-			nameLabel.Name = "NameLabel"
-			nameLabel.Size = UDim2.new(0.5, 0, 1, 0)
-			nameLabel.Position = UDim2.new(0, 8, 0, 0)
-
-			local statusLabel = makeLabel(entry, lic.status, FONTS.small, 10, COLORS.textDim)
-			statusLabel.Name = "StatusLabel"
-			statusLabel.Size = UDim2.new(0.22, 0, 1, 0)
-			statusLabel.Position = UDim2.new(0.5, 0, 0, 0)
-			statusLabel.TextXAlignment = Enum.TextXAlignment.Center
-
-			local addBtn = makeButton(entry, "+", COLORS.green, COLORS.text, FONTS.header, 14)
-			addBtn.Size = UDim2.new(0, 28, 0, 28)
-			addBtn.Position = UDim2.new(1, -34, 0.5, -14)
-
-			local conn = addBtn.MouseButton1Click:Connect(function()
-				if not state.currentTradeId then return end
-				if state.currentState ~= TradeState.Trading then
-					showToast("Cannot modify offer in current state.")
-					return
-				end
-				resetReadyState()
-
-				TradeUpdateRE:FireServer({
-					tradeId = state.currentTradeId,
-					action = "AddLicense",
-					licenseId = lic.id,
-				})
-			end)
-			table.insert(inventoryConnections, conn)
-		end
-	end
-end
-
-local function refreshInventory()
-	-- Stop any existing loading spinner animation
-	local existingLoading = inventoryScroll:FindFirstChild("LoadingContainer")
-	if existingLoading then
-		local stopFunc = existingLoading.StopSpinner
-		if type(stopFunc) == "function" then
-			stopFunc()
-		end
-		existingLoading:Destroy()
-	end
-
-	-- Disconnect inventory connections before diff update
-	disconnectInventoryConnections()
-
-	-- Clear only non-entry children (loading containers, etc.)
-	for _, child in ipairs(inventoryScroll:GetChildren()) do
-		if child.Name ~= "LoadingContainer" and not child:IsA("Frame") then
-			child:Destroy()
-		end
-	end
-
-	if state.licensesStatus == "loading" and #state.myLicenses == 0 then
-		showInventoryLoading()
 		return
 	end
 
-	if state.licensesStatus == "retrying" and #state.myLicenses == 0 then
-		showInventoryRetry()
+	if data.action == "ActionRejected" then
+		if data.reason == "trade_locked" then
+			notificationController:Show("Cannot unready - your partner has already confirmed.")
+		end
+
+		-- Clear whichever button's optimistic timeout this rejection answers
+		if tradeController.ButtonTimeoutTasks and tradeController.ButtonTimeoutTasks.unready then
+			task.cancel(tradeController.ButtonTimeoutTasks.unready)
+			tradeController.ButtonTimeoutTasks.unready = nil
+		end
+		state.buttonStates.unready = false
+		if unreadyBtn.Active == false then
+			unreadyBtn.Active = true
+			unreadyBtn.AutoButtonColor = true
+		end
+
 		return
 	end
 
-	if state.licensesStatus == "error" and #state.myLicenses == 0 then
-		showInventoryError()
-		return
+	state.myReady = data.myReady
+	state.theirReady = data.theirReady
+	state.myConfirmed = data.myConfirmed
+	state.theirConfirmed = data.theirConfirmed
+
+	-- Cancel ready button timeout and toggle visibility based on myReady state
+	if tradeController.ButtonTimeoutTasks and tradeController.ButtonTimeoutTasks.ready then
+		task.cancel(tradeController.ButtonTimeoutTasks.ready)
+		tradeController.ButtonTimeoutTasks.ready = nil
+	end
+	state.buttonStates.ready = false
+	readyBtn.Visible = not data.myReady
+	unreadyBtn.Visible = data.myReady
+	if readyBtn.Active == false then
+		readyBtn.Active = true
+		readyBtn.AutoButtonColor = true
+	end
+	if unreadyBtn.Active == false then
+		unreadyBtn.Active = true
+		unreadyBtn.AutoButtonColor = true
 	end
 
-	buildInventoryEntries()
-end
+	-- Cancel unready button timeout
+	if tradeController.ButtonTimeoutTasks and tradeController.ButtonTimeoutTasks.unready then
+		task.cancel(tradeController.ButtonTimeoutTasks.unready)
+		tradeController.ButtonTimeoutTasks.unready = nil
+	end
+	state.buttonStates.unready = false
 
--- ============================================================
--- PHASE 5: OFFER LOGIC
--- ============================================================
-local function refreshOffers(tradeState)
-	-- Disconnect offer connections before diff update
-	disconnectOfferConnections()
-
-	-- Track current offers to remove stale entries
-	local currentMyOffers = {}
-	for i, lic in ipairs(tradeState.myOfferedLicenses) do
-		currentMyOffers[lic.id] = true
+	-- Cancel confirm button timeout and toggle visibility based on myConfirmed state
+	if tradeController.ButtonTimeoutTasks and tradeController.ButtonTimeoutTasks.confirm then
+		task.cancel(tradeController.ButtonTimeoutTasks.confirm)
+		tradeController.ButtonTimeoutTasks.confirm = nil
+	end
+	state.buttonStates.confirm = false
+	-- Show confirm button when both players are ready
+	confirmBtn.Visible = data.myReady and data.theirReady
+	if confirmBtn.Active == false then
+		confirmBtn.Active = true
+		confirmBtn.AutoButtonColor = true
 	end
 
-	local currentTheirOffers = {}
-	for i, lic in ipairs(tradeState.theirOfferedLicenses) do
-		currentTheirOffers[lic.id] = true
-	end
-
-	-- Remove entries for licenses that no longer exist in my offer
-	for licId, entry in pairs(myOfferEntries) do
-		if not currentMyOffers[licId] then
-			entry:Destroy()
-			myOfferEntries[licId] = nil
-		end
-	end
-
-	-- Remove entries for licenses that no longer exist in their offer
-	for licId, entry in pairs(theirOfferEntries) do
-		if not currentTheirOffers[licId] then
-			entry:Destroy()
-			theirOfferEntries[licId] = nil
-		end
-	end
-
-	-- Update or create entries for my offer
-	for i, lic in ipairs(tradeState.myOfferedLicenses) do
-		local entry = myOfferEntries[lic.id]
-		
-		if not entry then
-			-- Create new entry
-			entry = Instance.new("Frame")
-			entry.Name = "MyOfferEntry_" .. tostring(lic.id)
-			entry.Size = UDim2.new(1, 0, 0, 32)
-			entry.BackgroundColor3 = COLORS.bgDark
-			entry.BorderSizePixel = 0
-			addCorner(entry, 6)
-			entry.Parent = myOfferScroll
-			myOfferEntries[lic.id] = entry
-
-			-- Display license name instead of UUID
-			local displayName = lic.displayName or lic.name or tostring(lic.id)
-			local nameLabel = makeLabel(entry, displayName, FONTS.small, 12, COLORS.text)
-			nameLabel.Size = UDim2.new(0.7, 0, 1, 0)
-			nameLabel.Position = UDim2.new(0, 8, 0, 0)
-
-			local removeBtn = makeButton(entry, "\226\136\146", COLORS.red, COLORS.text, FONTS.header, 14)
-			removeBtn.Size = UDim2.new(0, 24, 0, 24)
-			removeBtn.Position = UDim2.new(1, -30, 0.5, -12)
-
-			local conn = removeBtn.MouseButton1Click:Connect(function()
-				-- Local validation before server call
-				if not state.currentTradeId then return end
-				if state.currentState ~= TradeState.Trading then
-					showToast("Cannot modify offer in current state.")
-					return
-				end
-				-- Reset ready state locally for immediate UI feedback (without clearing offers)
-				resetReadyState()
-
-				TradeUpdateRE:FireServer({
-					tradeId = state.currentTradeId,
-					action = "RemoveLicense",
-					licenseId = lic.id,
-				})
-			end)
-			table.insert(offerConnections, conn)
-		end
-	end
-
-	-- Update or create entries for their offer
-	for i, lic in ipairs(tradeState.theirOfferedLicenses) do
-		local entry = theirOfferEntries[lic.id]
-		
-		if not entry then
-			-- Create new entry
-			entry = Instance.new("Frame")
-			entry.Name = "TheirOfferEntry_" .. tostring(lic.id)
-			entry.Size = UDim2.new(1, 0, 0, 32)
-			entry.BackgroundColor3 = COLORS.bgDark
-			entry.BorderSizePixel = 0
-			addCorner(entry, 6)
-			entry.Parent = theirOfferScroll
-			theirOfferEntries[lic.id] = entry
-
-			-- Display license name instead of UUID
-			local displayName = lic.displayName or lic.name or tostring(lic.id)
-			local nameLabel = makeLabel(entry, displayName, FONTS.small, 12, COLORS.text)
-			nameLabel.Size = UDim2.new(1, -10, 1, 0)
-			nameLabel.Position = UDim2.new(0, 8, 0, 0)
-		end
-	end
-
-	myOfferTitle.Text = "Your Offer (" .. #tradeState.myOfferedLicenses .. ")"
-	theirOfferTitle.Text = "Their Offer (" .. #tradeState.theirOfferedLicenses .. ")"
-end
-
--- ============================================================
--- PHASE 6: READY/CONFIRM STATUS LOGIC
--- ============================================================
-local function updateStatus(tradeState)
-	myReadyLabel.Text = tradeState.myReady and "\226\156\147 You: Ready" or "\226\151\139 You: Not Ready"
-	myReadyLabel.TextColor3 = tradeState.myReady and COLORS.green or COLORS.textDim
-
-	theirReadyLabel.Text = tradeState.theirReady and "\226\156\147 Partner: Ready" or "\226\151\139 Partner: Not Ready"
-	theirReadyLabel.TextColor3 = tradeState.theirReady and COLORS.green or COLORS.textDim
-
-	myConfirmLabel.Text = tradeState.myConfirmed and "\226\156\147 You: Confirmed" or "\226\151\139 You: Not Confirmed"
-	myConfirmLabel.TextColor3 = tradeState.myConfirmed and COLORS.green or COLORS.textDim
-
-	theirConfirmLabel.Text = tradeState.theirConfirmed and "\226\156\147 Partner: Confirmed" or "\226\151\139 Partner: Not Confirmed"
-	theirConfirmLabel.TextColor3 = tradeState.theirConfirmed and COLORS.green or COLORS.textDim
-
-	if tradeState.myConfirmed then
-		setState(TradeState.Confirming)
-		setTradeButtons("waiting_confirm")
-	elseif tradeState.myReady then
-		if tradeState.theirReady then
-			setState(TradeState.Ready)
-			setTradeButtons("both_ready")
-		else
-			setState(TradeState.Trading)
-			setTradeButtons("waiting_partner")
+	-- Transition to Ready state when both players are ready, back to Trading if not
+	if data.myReady and data.theirReady then
+		if TradeState.Get() == TradeState.Trading then
+			TradeState.Set(TradeState.Ready)
 		end
 	else
-		setState(TradeState.Trading)
-		setTradeButtons("idle")
+		if TradeState.Get() == TradeState.Ready then
+			TradeState.Set(TradeState.Trading)
+		end
 	end
 
-	-- Re-enable buttons after server response and cancel timeouts
-	setAllButtonsEnabled(true)
-	resetButtonStates()
-
-	state.myReady = tradeState.myReady
-	state.theirReady = tradeState.theirReady
-	state.myConfirmed = tradeState.myConfirmed
-	state.theirConfirmed = tradeState.theirConfirmed
-	state.myOffer = {}
-	for _, lic in ipairs(tradeState.myOfferedLicenses) do
-		table.insert(state.myOffer, lic.id)
+	-- Transition to Confirming state when player confirms
+	if data.myConfirmed then
+		if TradeState.Get() == TradeState.Ready then
+			TradeState.Set(TradeState.Confirming)
+		end
 	end
-	state.theirOffer = tradeState.theirOfferedLicenses
-end
 
--- ============================================================
--- PHASE 7: SUCCESS LOGIC
--- ============================================================
-local function showSuccess(receivedLicenses)
-	clearChildren(successScroll, "Frame")
+	offerController:SetOffers(data.myOfferedLicenses, data.theirOfferedLicenses)
+	statusController:SetReady(data.myReady, data.theirReady)
+	statusController:SetConfirmed(data.myConfirmed, data.theirConfirmed)
+	inventoryController:Refresh(offerController.MyOffer)
+end)
 
-	if #receivedLicenses == 0 then
-		local emptyLabel = makeLabel(successScroll, "No licenses received", FONTS.body, 13, COLORS.textDim)
-		emptyLabel.Size = UDim2.new(1, 0, 0, 30)
-		emptyLabel.TextXAlignment = Enum.TextXAlignment.Center
+-- Trade cancelled
+remotes.tradeCancelled.OnClientEvent:Connect(function(data)
+	if not data then
+		warn("[TradeClient] Invalid trade cancelled data")
+		return
+	end
+	
+	if data.tradeId and data.tradeId ~= state.currentTradeId then
+		return
+	end
+	
+	if data.reason == "player_left" then
+		notificationController:Show("Trade cancelled.")
+		notificationController:Show("The other player left the game.")
+	elseif data.reason == "cancelled" then
+		notificationController:Show("Trade was cancelled.")
+	elseif data.reason == "timeout" then
+		notificationController:Show("Trade timed out due to inactivity.")
+	elseif data.reason == "validation_failed" then
+		notificationController:Show("Trade validation failed.")
 	else
-		for i, lic in ipairs(receivedLicenses) do
-			local entry = Instance.new("Frame")
-			entry.Size = UDim2.new(1, 0, 0, 32)
-			entry.BackgroundColor3 = COLORS.bgLight
-			entry.BorderSizePixel = 0
-			addCorner(entry, 6)
-			entry.Parent = successScroll
+		notificationController:Show("Trade ended: " .. tostring(data.reason))
+	end
+	
+	if TradeState.Set(TradeState.Cancelled) then
+		tradeController:ResetTradeUI()
+	end
+end)
 
-			-- Display license name instead of UUID
-			local displayName = lic.displayName or lic.name or "Unknown License"
-			local nameLabel = makeLabel(entry, displayName, FONTS.body, 13, COLORS.success)
-			nameLabel.Size = UDim2.new(1, -10, 1, 0)
-			nameLabel.Position = UDim2.new(0, 10, 0, 0)
+-- Get player licenses response
+remotes.getPlayerLicenses.OnClientEvent:Connect(function(requestId, data)
+	if not requestId or requestId ~= tradeController.CurrentFetchRequestId then return end
+	tradeController.CurrentFetchRequestId = nil
+
+	if data and data.success and data.data then
+		state.myLicenses = data.data.licenses or {}
+		state.licensesRetryCount = 0
+		state.licensesStatus = "idle"
+		state.buttonStates.retryLicenses = false
+		if tradeController.FetchTimeoutTask then
+			task.cancel(tradeController.FetchTimeoutTask)
+			tradeController.FetchTimeoutTask = nil
 		end
-	end
-
-	successFrame.Visible = true
-	tradeWindow.Visible = false
-end
-
--- ============================================================
--- RESET
--- ============================================================
-local function resetTradeUI()
-	state.currentTradeId = nil
-	state.partnerName = nil
-	state.partnerId = nil
-	state.myOffer = {}
-	state.theirOffer = {}
-	state.myReady = false
-	state.theirReady = false
-	state.myConfirmed = false
-	state.theirConfirmed = false
-
-	tradeWindow.Visible = false
-	requestPopupFrame.Visible = false
-	successFrame.Visible = false
-
-	-- Cancel any pending retry task
-	if currentRetryTask then
-		task.cancel(currentRetryTask)
-		currentRetryTask = nil
-	end
-	
-	-- Cancel fetch timeout task
-	if fetchTimeoutTask then
-		task.cancel(fetchTimeoutTask)
-		fetchTimeoutTask = nil
-	end
-
-	-- Cleanup all animations and temporary connections
-	cleanupAllAnimations()
-	disconnectAllTemporaryConnections()
-	clearChildren(myOfferScroll, "Frame")
-	clearChildren(theirOfferScroll, "Frame")
-	clearChildren(inventoryScroll, "Frame")
-	inventoryEntries = {} -- Clear inventory entry cache
-	myOfferEntries = {} -- Clear my offer entry cache
-	theirOfferEntries = {} -- Clear their offer entry cache
-	
-	-- Clear state data
-	state.myLicenses = {}
-	state.myOffer = {}
-	state.theirOffer = {}
-	
-	resetReadyState()
-	
-	-- Re-enable buttons
-	setAllButtonsEnabled(true)
-	resetButtonStates()
-	
-	-- Reset state to Idle
-	setState(TradeState.Idle)
-end
-
--- ============================================================
--- FETCH LICENSES
--- ============================================================
-local FETCH_TIMEOUT = 30 -- seconds
-local fetchTimeoutTask = nil
-
-fetchLicenses = function()
-	if state.licensesStatus == "loading" then return end
-	
-	-- Cancel any existing retry task
-	if currentRetryTask then
-		task.cancel(currentRetryTask)
-		currentRetryTask = nil
-	end
-	
-	local requestId = HttpService:GenerateGUID(false)
-	currentFetchRequestId = requestId
-	state.licensesStatus = "loading"
-	state.licensesRetryCount = 0
-	setState(TradeState.LoadingInventory)
-	refreshInventory()
-	GetPlayerLicensesRE:FireServer(requestId)
-	
-	-- Set timeout to prevent infinite loading - each request owns its timeout
-	local timeoutRequestId = requestId
-	fetchTimeoutTask = task.delay(CONFIG.FetchTimeout, function()
-		if timeoutRequestId ~= currentFetchRequestId then
-			-- This timeout is for an old request, ignore it
-			return
+		if TradeState.Get() == TradeState.LoadingInventory then
+			TradeState.Set(TradeState.Idle)
 		end
+		inventoryController:Refresh(offerController.MyOffer)
+	elseif state.licensesRetryCount < CONFIG.LicenseMaxRetries then
+		state.licensesRetryCount += 1
+		state.licensesStatus = "retrying"
+		local delay = CONFIG.LicenseRetryDelays[state.licensesRetryCount] or 20
+		notificationController:Show("Failed to load licenses. Retrying in " .. delay .. "s... (" .. state.licensesRetryCount .. "/" .. CONFIG.LicenseMaxRetries .. ")")
+		inventoryController:Refresh(offerController.MyOffer)
+		tradeController.RetryTask = task.delay(delay, function()
+			if state.licensesStatus ~= "retrying" then return end
+			local newRequestId = HttpService:GenerateGUID(false)
+			tradeController.CurrentFetchRequestId = newRequestId
+			state.licensesStatus = "loading"
+			inventoryController:Refresh(offerController.MyOffer)
+			remotes.getPlayerLicenses:FireServer(newRequestId)
+			tradeController.RetryTask = nil
+		end)
+	else
 		state.licensesStatus = "error"
 		state.buttonStates.retryLicenses = false
-		showToast("License fetch timed out after " .. CONFIG.FetchTimeout .. " seconds.")
-		if state.currentState == TradeState.LoadingInventory then
-			setState(TradeState.Idle)
+		notificationController:Show("Failed to load licenses after " .. CONFIG.LicenseMaxRetries .. " attempts.")
+		if TradeState.Get() == TradeState.LoadingInventory then
+			TradeState.Set(TradeState.Idle)
 		end
-		refreshInventory()
-		fetchTimeoutTask = nil
+		inventoryController:Refresh(offerController.MyOffer)
+	end
+end)
+
+-- ============================================================
+-- PLAYER LIST / TRADE REQUEST FLOW
+-- ============================================================
+playerListUI.PlayerSelected = function(selectedPlayer)
+	tradeController:SendTradeRequest(selectedPlayer.UserId)
+	TradeState.Set(TradeState.WaitingForRequestResponse)
+end
+
+if tradeButton then
+	tradeButton.MouseButton1Click:Connect(function()
+		TradeState.Set(TradeState.SelectingPlayer)
+		playerListUI:Clear()
+		for _, otherPlayer in ipairs(Players:GetPlayers()) do
+			if otherPlayer ~= player then
+				playerListUI:AddPlayer(otherPlayer)
+			end
+		end
+		tradeWindowUI:ShowPlayerList()
 	end)
 end
 
--- ============================================================
--- BUTTON HANDLERS
--- ============================================================
-
--- Trade button / keybind
-local tradeButtonConn = tradeButton.MouseButton1Click:Connect(function()
-	if state.currentTradeId then
-		tradeWindow.Visible = not tradeWindow.Visible
-		if not tradeWindow.Visible then
-			-- Clear frames immediately when closing to prevent stale UI
-			clearChildren(myOfferScroll, "Frame")
-			clearChildren(theirOfferScroll, "Frame")
-			clearChildren(inventoryScroll, "Frame")
-			inventoryEntries = {}
-			myOfferEntries = {}
-			theirOfferEntries = {}
-		end
-	else
-		playerListFrame.Visible = not playerListFrame.Visible
-		if playerListFrame.Visible then
-			if setState(TradeState.SelectingPlayer) then
-				refreshPlayerList()
-			end
-		else
-			setState(TradeState.Idle)
-		end
-	end
+playerListClose.MouseButton1Click:Connect(function()
+	tradeWindowUI:HideAll()
+	TradeState.Set(TradeState.Idle)
 end)
-table.insert(permanentConnections, tradeButtonConn)
 
-local inputBeganConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if gameProcessed then return end
-	if input.KeyCode == Enum.KeyCode.T then
-		if state.currentTradeId then
-			tradeWindow.Visible = not tradeWindow.Visible
-			if not tradeWindow.Visible then
-				-- Clear frames immediately when closing to prevent stale UI
-				clearChildren(myOfferScroll, "Frame")
-				clearChildren(theirOfferScroll, "Frame")
-				clearChildren(inventoryScroll, "Frame")
-				inventoryEntries = {}
-				myOfferEntries = {}
-				theirOfferEntries = {}
-			end
-		else
-			playerListFrame.Visible = not playerListFrame.Visible
-			if playerListFrame.Visible then
-				if setState(TradeState.SelectingPlayer) then
-					refreshPlayerList()
-				end
-			else
-				setState(TradeState.Idle)
-			end
-		end
-	end
+successCloseBtn.MouseButton1Click:Connect(function()
+	successController:Hide()
+	TradeState.Set(TradeState.Idle)
 end)
-table.insert(permanentConnections, inputBeganConn)
-
-local playerListCloseConn = playerListClose.MouseButton1Click:Connect(function()
-	playerListFrame.Visible = false
-	setState(TradeState.Idle)
-	-- Clear player list entries when closing
-	for userId, entry in pairs(playerEntries) do
-		entry:Destroy()
-		playerEntries[userId] = nil
-	end
-end)
-table.insert(permanentConnections, playerListCloseConn)
 
 -- Phase 2: Accept/Decline
 local currentRequestId = nil
 local requestTimerConn = nil
 
-local acceptBtnConn = acceptBtn.MouseButton1Click:Connect(function()
+acceptBtn.MouseButton1Click:Connect(function()
 	if currentRequestId then
-		TradeRequestResponseRE:FireServer({
-			accepted = true,
-			requestId = currentRequestId,
-		})
-		requestPopupFrame.Visible = false
+		tradeController:RespondToRequest(true, currentRequestId)
+		tradeWindowUI:HideAll()
 		currentRequestId = nil
 		if requestTimerConn then
 			requestTimerConn:Disconnect()
 			requestTimerConn = nil
 		end
-		setState(TradeState.Trading)
 	end
 end)
-table.insert(permanentConnections, acceptBtnConn)
 
-local declineBtnConn = declineBtn.MouseButton1Click:Connect(function()
-	if declineBtn.Active == false then return end -- Debounce
+declineBtn.MouseButton1Click:Connect(function()
+	if declineBtn.Active == false then return end
 	if currentRequestId then
-		TradeRequestResponseRE:FireServer({
-			accepted = false,
-			requestId = currentRequestId,
-		})
-		requestPopupFrame.Visible = false
+		tradeController:RespondToRequest(false, currentRequestId)
+		tradeWindowUI:HideAll()
 		currentRequestId = nil
 		if requestTimerConn then
 			requestTimerConn:Disconnect()
 			requestTimerConn = nil
 		end
-		setState(TradeState.Idle)
+		TradeState.Set(TradeState.Idle)
 	end
 end)
-table.insert(permanentConnections, declineBtnConn)
 
--- Phase 6: Ready/Unready/Confirm
-local readyBtnConn = readyBtn.MouseButton1Click:Connect(function()
-	-- Local validation before server call
-	if not state.currentTradeId then
-		showToast("No active trade.")
-		return
-	end
-	if state.buttonStates.ready then return end
-	
-	-- Prevent readying with empty offer
-	if #state.myOffer == 0 then
-		showToast("Add at least one license to your offer before readying.")
-		return
-	end
-	
-	-- Validate trade state
-	if state.currentState ~= TradeState.Trading then
-		showToast("Cannot ready in current state.")
-		return
-	end
-	
-	-- Button state locking is sufficient - timestamp debounce removed as redundant
-	state.buttonStates.ready = true
-	setButtonEnabled(readyBtn, false)
-	
-	-- Set timeout for server acknowledgement
-	if buttonTimeoutTasks.ready then
-		task.cancel(buttonTimeoutTasks.ready)
-	end
-	buttonTimeoutTasks.ready = task.delay(CONFIG.ServerAckTimeout, function()
-		state.buttonStates.ready = false
-		setButtonEnabled(readyBtn, true)
-		showToast("Server not responding. Please try again.")
-		buttonTimeoutTasks.ready = nil
-	end)
-	
-	TradeUpdateRE:FireServer({
-		tradeId = state.currentTradeId,
-		action = "Ready",
-		ready = true,
-	})
-end)
-table.insert(permanentConnections, readyBtnConn)
-
-local unreadyBtnConn = unreadyBtn.MouseButton1Click:Connect(function()
-	-- Local validation before server call
-	if not state.currentTradeId then
-		showToast("No active trade.")
-		return
-	end
-	if state.buttonStates.unready then return end
-	
-	-- Validate trade state
-	if state.currentState ~= TradeState.Trading and state.currentState ~= TradeState.Ready then
-		showToast("Cannot unready in current state.")
-		return
-	end
-	
-	-- Button state locking is sufficient - timestamp debounce removed as redundant
-	state.buttonStates.unready = true
-	setButtonEnabled(unreadyBtn, false)
-	
-	-- Set timeout for server acknowledgement
-	if buttonTimeoutTasks.unready then
-		task.cancel(buttonTimeoutTasks.unready)
-	end
-	buttonTimeoutTasks.unready = task.delay(CONFIG.ServerAckTimeout, function()
-		state.buttonStates.unready = false
-		setButtonEnabled(unreadyBtn, true)
-		showToast("Server not responding. Please try again.")
-		buttonTimeoutTasks.unready = nil
-	end)
-	
-	TradeUpdateRE:FireServer({
-		tradeId = state.currentTradeId,
-		action = "Ready",
-		ready = false,
-	})
-end)
-table.insert(permanentConnections, unreadyBtnConn)
-
-local confirmBtnConn = confirmBtn.MouseButton1Click:Connect(function()
-	-- Local validation before server call
-	if not state.currentTradeId then
-		showToast("No active trade.")
-		return
-	end
-	if state.buttonStates.confirm then return end
-	
-	-- Validate trade state - can only confirm when both ready
-	if not state.myReady or not state.theirReady then
-		showToast("Both players must be ready before confirming.")
-		return
-	end
-	if state.currentState ~= TradeState.Ready then
-		showToast("Cannot confirm in current state.")
-		return
-	end
-	
-	-- Validate offer is not empty
-	if #state.myOffer == 0 then
-		showToast("Cannot confirm with empty offer.")
-		return
-	end
-	
-	-- Button state locking is sufficient - timestamp debounce removed as redundant
-	state.buttonStates.confirm = true
-	setButtonEnabled(confirmBtn, false)
-	
-	-- Set timeout for server acknowledgement
-	if buttonTimeoutTasks.confirm then
-		task.cancel(buttonTimeoutTasks.confirm)
-	end
-	buttonTimeoutTasks.confirm = task.delay(CONFIG.ServerAckTimeout, function()
-		state.buttonStates.confirm = false
-		setButtonEnabled(confirmBtn, true)
-		showToast("Server not responding. Please try again.")
-		buttonTimeoutTasks.confirm = nil
-	end)
-	
-	TradeConfirmRE:FireServer({
-		tradeId = state.currentTradeId,
-	})
-end)
-table.insert(permanentConnections, confirmBtnConn)
-
--- Cancel trade
-local tradeCloseBtnConn = tradeCloseBtn.MouseButton1Click:Connect(function()
-	-- Local validation before server call
-	if not state.currentTradeId then
-		showToast("No active trade.")
-		return
-	end
-	if state.buttonStates.cancel then return end
-	
-	-- Validate trade state
-	if state.currentState ~= TradeState.Trading and state.currentState ~= TradeState.Ready then
-		showToast("Cannot cancel in current state.")
-		return
-	end
-	
-	-- Button state locking is sufficient - timestamp debounce removed as redundant
-	state.buttonStates.cancel = true
-	setButtonEnabled(tradeCloseBtn, false)
-	
-	-- Set timeout for server acknowledgement
-	if buttonTimeoutTasks.cancel then
-		task.cancel(buttonTimeoutTasks.cancel)
-	end
-	buttonTimeoutTasks.cancel = task.delay(CONFIG.ServerAckTimeout, function()
-		state.buttonStates.cancel = false
-		setButtonEnabled(tradeCloseBtn, true)
-		showToast("Server not responding. Please try again.")
-		buttonTimeoutTasks.cancel = nil
-	end)
-	
-	TradeUpdateRE:FireServer({
-		tradeId = state.currentTradeId,
-		action = "Cancel",
-	})
-	resetTradeUI()
-end)
-table.insert(permanentConnections, tradeCloseBtnConn)
-
--- Success close
-local successCloseBtnConn = successCloseBtn.MouseButton1Click:Connect(function()
-	successFrame.Visible = false
-	fetchLicenses()
-end)
-table.insert(permanentConnections, successCloseBtnConn)
-
--- ============================================================
--- REMOTE EVENT LISTENERS
--- ============================================================
-
--- Incoming trade request (Phase 2)
-table.insert(permanentConnections, SendTradeRequestRE.OnClientEvent:Connect(function(data)
-	-- Validate data structure
+-- Incoming trade request handler
+remotes.sendTradeRequest.OnClientEvent:Connect(function(data)
 	if not data or not data.requestId or not data.requesterName then
 		warn("[TradeClient] Invalid trade request data")
 		return
 	end
 	
 	if state.currentTradeId then
-		TradeRequestResponseRE:FireServer({
-			accepted = false,
-			requestId = data.requestId,
-		})
+		tradeController:RespondToRequest(false, data.requestId)
 		return
 	end
 
 	currentRequestId = data.requestId
 	requestNameLabel.Text = data.requesterName .. " wants to trade!"
-	if setState(TradeState.IncomingRequest) then
-		requestPopupFrame.Visible = true
+	if TradeState.Set(TradeState.IncomingRequest) then
+		tradeWindowUI:ShowRequestPopup()
 	end
 
-	-- Reset timer bar
 	requestTimerBar.Size = UDim2.new(0.8, 0, 0, 4)
-	requestTimerBar.BackgroundColor3 = COLORS.accent
+	requestTimerBar.BackgroundColor3 = Color3.fromRGB(0, 170, 255)
 
-	-- Timer animation (30s)
 	if requestTimerConn then
 		requestTimerConn:Disconnect()
 	end
 	local startTime = tick()
-	local timerDuration = 30
-	requestTimerConn = RunService.RenderStepped:Connect(function()
+	local timerDuration = CONFIG.RequestTimeout
+	requestTimerConn = game:GetService("RunService").RenderStepped:Connect(function()
 		local elapsed = tick() - startTime
 		local remaining = 1 - (elapsed / timerDuration)
 		if remaining <= 0 then
 			requestTimerBar.Size = UDim2.new(0, 0, 0, 4)
-			requestTimerBar.BackgroundColor3 = COLORS.red
+			requestTimerBar.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
 			if requestTimerConn then
 				requestTimerConn:Disconnect()
 				requestTimerConn = nil
 			end
-			-- Auto-decline on timeout
 			if currentRequestId then
-				TradeRequestResponseRE:FireServer({
-					accepted = false,
-					requestId = currentRequestId,
-				})
+				tradeController:RespondToRequest(false, currentRequestId)
 				currentRequestId = nil
-				requestPopupFrame.Visible = false
-				setState(TradeState.Idle)
+				tradeWindowUI:HideAll()
+				TradeState.Set(TradeState.Idle)
 			end
 			return
 		end
 		requestTimerBar.Size = UDim2.new(0.8 * remaining, 0, 0, 4)
-		requestTimerBar.BackgroundColor3 = remaining < 0.3 and COLORS.red or COLORS.accent
+		requestTimerBar.BackgroundColor3 = remaining < 0.3 and Color3.fromRGB(220, 50, 50) or Color3.fromRGB(0, 170, 255)
 	end)
-	trackAnimation({connection = requestTimerConn})
-end))
+end)
 
 -- Trade request response (for the requester)
-table.insert(permanentConnections, TradeRequestResponseRE.OnClientEvent:Connect(function(data)
-	-- Validate data structure
+remotes.tradeRequestResponse.OnClientEvent:Connect(function(data)
 	if not data or type(data.accepted) ~= "boolean" then
 		warn("[TradeClient] Invalid trade request response data")
 		return
 	end
 	
 	if data.accepted then
-		showToast((data.targetName or "Player") .. " accepted your trade request!")
+		notificationController:Show((data.targetName or "Player") .. " accepted your trade request!")
 	else
 		local reasons = {
 			declined = (data.targetName or "Player") .. " declined your trade request",
@@ -1815,165 +1108,7 @@ table.insert(permanentConnections, TradeRequestResponseRE.OnClientEvent:Connect(
 			target_in_trade = (data.targetName or "Player") .. " is already in a trade",
 			superseded = "Your request to " .. (data.targetName or "Player") .. " was superseded",
 		}
-		showToast(reasons[data.reason] or "Trade request failed")
-		setState(TradeState.Idle)
+		notificationController:Show(reasons[data.reason] or "Trade request failed")
+		TradeState.Set(TradeState.Idle)
 	end
 end)
-
--- Trade started (Phase 3)
-table.insert(permanentConnections, TradeStartedRE.OnClientEvent:Connect(function(data)
-	-- Validate data structure
-	if not data or not data.tradeId or not data.partnerName then
-		warn("[TradeClient] Invalid trade started data")
-		return
-	end
-	
-	-- Prevent late-arriving packets from opening old windows
-	if state.currentTradeId then
-		warn("[TradeClient] Ignoring trade start - already in trade")
-		return
-	end
-	
-	state.currentTradeId = data.tradeId
-	state.partnerName = data.partnerName
-
-	if setState(TradeState.Trading) then
-		tradeTitleLabel.Text = "Trading with " .. data.partnerName
-		playerListFrame.Visible = false
-		requestPopupFrame.Visible = false
-		tradeWindow.Visible = true
-
-		setTradeButtons("idle")
-
-		fetchLicenses()
-	end
-end))
-
--- Trade update (state changes, Phase 5-6)
-table.insert(permanentConnections, TradeUpdateRE.OnClientEvent:Connect(function(data)
-	-- Validate data structure
-	if not data or not data.tradeId then
-		warn("[TradeClient] Invalid trade update data")
-		return
-	end
-	
-	-- Ignore stale packets
-	if data.tradeId ~= state.currentTradeId then return end
-	
-	-- Completion event (Phase 7)
-	if data.action == "Completed" then
-		showSuccess(data.receivedLicenses or {})
-		state.currentTradeId = nil
-		if setState(TradeState.Completed) then
-			-- Refresh licenses immediately after trade completion
-			fetchLicenses()
-		end
-		return
-	end
-
-	-- Regular trade state update
-	refreshOffers(data)
-	updateStatus(data)
-	refreshInventory()
-end))
-
--- Trade cancelled
-table.insert(permanentConnections, TradeCancelledRE.OnClientEvent:Connect(function(data)
-	-- Validate data structure
-	if not data then
-		warn("[TradeClient] Invalid trade cancelled data")
-		return
-	end
-	
-	-- Ignore stale packets
-	if data.tradeId and data.tradeId ~= state.currentTradeId then
-		return
-	end
-	
-	-- Handle disconnects with friendly messages
-	if data.reason == "player_left" then
-		showToast("Trade cancelled.")
-		showToast("The other player left the game.")
-	elseif data.reason == "cancelled" then
-		showToast("Trade was cancelled.")
-	elseif data.reason == "timeout" then
-		showToast("Trade timed out due to inactivity.")
-	elseif data.reason == "validation_failed" then
-		showToast("Trade validation failed.")
-	else
-		showToast("Trade ended: " .. tostring(data.reason))
-	end
-	
-	if setState(TradeState.Cancelled) then
-		resetTradeUI()
-	end
-end))
-
--- Get player licenses response
-table.insert(permanentConnections, GetPlayerLicensesRE.OnClientEvent:Connect(function(requestId, data)
-	-- Validate request ID to ignore stale responses
-	if not requestId or requestId ~= currentFetchRequestId then return end
-	currentFetchRequestId = nil
-
-	if data and data.success and data.data then
-		state.myLicenses = data.data.licenses or {}
-		state.licensesRetryCount = 0
-		state.licensesStatus = "idle"
-		state.buttonStates.retryLicenses = false
-		-- Cancel fetch timeout on success
-		if fetchTimeoutTask then
-			task.cancel(fetchTimeoutTask)
-			fetchTimeoutTask = nil
-		end
-		if state.currentState == TradeState.LoadingInventory then
-			setState(TradeState.Idle)
-		end
-		refreshInventory()
-	elseif state.licensesRetryCount < LICENSE_MAX_RETRIES then
-		state.licensesRetryCount += 1
-		state.licensesStatus = "retrying"
-		local delay = LICENSE_RETRY_DELAYS[state.licensesRetryCount] or 20
-		showToast("Failed to load licenses. Retrying in " .. delay .. "s... (" .. state.licensesRetryCount .. "/" .. LICENSE_MAX_RETRIES .. ")")
-		refreshInventory()
-		currentRetryTask = task.delay(delay, function()
-			if state.licensesStatus ~= "retrying" then return end
-			local newRequestId = HttpService:GenerateGUID(false)
-			currentFetchRequestId = newRequestId
-			state.licensesStatus = "loading"
-			refreshInventory()
-			GetPlayerLicensesRE:FireServer(newRequestId)
-			currentRetryTask = nil
-		end)
-	else
-		state.licensesStatus = "error"
-		state.buttonStates.retryLicenses = false
-		showToast("Failed to load licenses after " .. LICENSE_MAX_RETRIES .. " attempts.")
-		if state.currentState == TradeState.LoadingInventory then
-			setState(TradeState.Idle)
-		end
-		refreshInventory()
-	end
-end))
-
--- ============================================================
--- PLAYER LIST REFRESH ON JOIN/LEAVE
--- ============================================================
-local playerAddedConn = Players.PlayerAdded:Connect(function(p)
-	if playerListFrame.Visible then
-		refreshPlayerList()
-	end
-end)
-table.insert(permanentConnections, playerAddedConn)
-
-local playerRemovingConn = Players.PlayerRemoving:Connect(function(p)
-	if playerListFrame.Visible then
-		refreshPlayerList()
-	end
-end)
-table.insert(permanentConnections, playerRemovingConn)
-
--- ============================================================
--- INITIAL LOAD
--- ============================================================
-fetchLicenses()
-print("[TradeClient] Production-ready: State machine, animation cleanup, network validation, stale packet prevention")
