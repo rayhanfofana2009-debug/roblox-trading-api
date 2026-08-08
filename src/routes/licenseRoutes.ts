@@ -20,7 +20,7 @@ const ownershipVerifyQuery = z.object({
 const licenseVerifyBody = z.object({
   userId: z.coerce.bigint(),
   licenseId: z.string().uuid()
-});
+}); // Per-instance verification route
 
 const transferParams = z.object({
   licenseId: z.string().uuid()
