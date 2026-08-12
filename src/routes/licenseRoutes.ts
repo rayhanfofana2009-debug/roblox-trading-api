@@ -584,11 +584,20 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
           }
         });
 
+        if (!originalLicense) {
+          request.log.error({
+            purchaseId: previousClaim.id,
+            buyerUserId: previousClaim.buyerUserId,
+            licenseTypeId: previousClaim.licenseTypeId
+          }, "Database inconsistency: purchase exists but no associated license found");
+          return reply.internalServerError("Database inconsistency: purchase without associated license");
+        }
+
         return reply.send({
           data: {
             success: true,
             alreadyClaimed: true,
-            licenseId: originalLicense?.id ?? "00000000-0000-0000-0000-000000000000",
+            licenseId: originalLicense.id,
             licenseTypeId: purchaseSource.licenseTypeId,
             displayName: purchaseSource.licenseType.displayName
           }
