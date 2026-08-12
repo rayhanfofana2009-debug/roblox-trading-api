@@ -517,7 +517,9 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
 
   app.post("/v1/license/claim", async (request, reply) => {
     request.log.info({
-      rawBody: request.body
+      userId: request.body?.userId,
+      gamepassId: request.body?.gamepassId,
+      universeId: request.body?.universeId
     }, "Incoming claim request");
 
     const parsedBody = claimBody.safeParse(request.body);
@@ -557,26 +559,36 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
         return reply.notFound("Gamepass not registered in system.");
       }
 
-      // Check if user already has a license for this gamepass
-      const existingLicense = await prisma.license.findFirst({
+      // A Game Pass may create only one transferable license, ever.
+      // The license may be traded, but the original buyer must not claim another.
+      const previousClaim = await prisma.purchase.findFirst({
         where: {
-          ownerUserId: userId,
-          licenseTypeId: purchaseSource.licenseTypeId,
-          status: LicenseStatus.ACTIVE
+          buyerUserId: userId,
+          licenseTypeId: purchaseSource.licenseTypeId
         },
-        include: {
-          licenseType: true
+        orderBy: {
+          createdAt: "asc"
         }
       });
 
-      if (existingLicense) {
+      if (previousClaim) {
+        const originalLicense = await prisma.license.findFirst({
+          where: {
+            createdFromPurchaseId: previousClaim.id
+          },
+          select: {
+            id: true,
+            licenseTypeId: true
+          }
+        });
+
         return reply.send({
           data: {
             success: true,
             alreadyClaimed: true,
-            licenseId: existingLicense.id,
-            licenseTypeId: existingLicense.licenseTypeId,
-            displayName: existingLicense.licenseType?.displayName
+            licenseId: originalLicense?.id ?? "00000000-0000-0000-0000-000000000000",
+            licenseTypeId: purchaseSource.licenseTypeId,
+            displayName: purchaseSource.licenseType.displayName
           }
         });
       }
