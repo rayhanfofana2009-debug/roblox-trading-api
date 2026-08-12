@@ -543,23 +543,24 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
       return reply.unauthorized("Invalid secret.");
     }
 
-    try {
-      // Find purchase source for this gamepass
-      const purchaseSource = await prisma.purchaseSource.findUnique({
-        where: {
-          universeId_gamepassId: {
-            universeId: universeId,
-            gamepassId
-          }
-        },
-        include: {
-          licenseType: true
+    // Find purchase source for this gamepass (needed for error handling)
+    const purchaseSource = await prisma.purchaseSource.findUnique({
+      where: {
+        universeId_gamepassId: {
+          universeId: universeId,
+          gamepassId
         }
-      });
-
-      if (!purchaseSource) {
-        return reply.notFound("Gamepass not registered in system.");
+      },
+      include: {
+        licenseType: true
       }
+    });
+
+    if (!purchaseSource) {
+      return reply.notFound("Gamepass not registered in system.");
+    }
+
+    try {
 
       // A Game Pass may create only one transferable license, ever.
       // The license may be traded, but the original buyer must not claim another.
@@ -649,6 +650,32 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
     } catch (error) {
       request.log.error(error);
       if (error instanceof Error) {
+        // Handle Prisma P2002 duplicate-key error (race condition)
+        if (error.message.includes("P2002") || error.message.includes("unique constraint")) {
+          // Find the existing license for this user and license type
+          const existingLicense = await prisma.license.findFirst({
+            where: {
+              ownerUserId: userId,
+              licenseTypeId: purchaseSource.licenseTypeId,
+              status: LicenseStatus.ACTIVE
+            },
+            include: {
+              licenseType: true
+            }
+          });
+
+          if (existingLicense) {
+            return reply.send({
+              data: {
+                success: true,
+                alreadyClaimed: true,
+                licenseId: existingLicense.id,
+                licenseTypeId: existingLicense.licenseTypeId,
+                displayName: existingLicense.licenseType?.displayName
+              }
+            });
+          }
+        }
         return reply.internalServerError(error.message);
       }
       throw error;

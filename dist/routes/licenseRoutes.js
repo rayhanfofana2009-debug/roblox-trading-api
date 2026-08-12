@@ -15,7 +15,7 @@ const ownershipVerifyQuery = z.object({
 const licenseVerifyBody = z.object({
     userId: z.coerce.bigint(),
     licenseId: z.string().uuid()
-});
+}); // Per-instance verification route
 const transferParams = z.object({
     licenseId: z.string().uuid()
 });
@@ -446,10 +446,14 @@ export async function registerLicenseRoutes(app) {
         });
     });
     app.post("/v1/license/claim", async (request, reply) => {
-        request.log.info({
-            rawBody: request.body
-        }, "Incoming claim request");
         const parsedBody = claimBody.safeParse(request.body);
+        if (parsedBody.success) {
+            request.log.info({
+                userId: parsedBody.data.userId,
+                gamepassId: parsedBody.data.gamepassId,
+                universeId: parsedBody.data.universeId
+            }, "Incoming claim request");
+        }
         if (!parsedBody.success) {
             request.log.error({
                 errors: parsedBody.error.flatten()
@@ -464,41 +468,58 @@ export async function registerLicenseRoutes(app) {
         if (secret !== expectedSecret) {
             return reply.unauthorized("Invalid secret.");
         }
-        try {
-            // Find purchase source for this gamepass
-            const purchaseSource = await prisma.purchaseSource.findUnique({
-                where: {
-                    universeId_gamepassId: {
-                        universeId: universeId,
-                        gamepassId
-                    }
-                },
-                include: {
-                    licenseType: true
+        // Find purchase source for this gamepass (needed for error handling)
+        const purchaseSource = await prisma.purchaseSource.findUnique({
+            where: {
+                universeId_gamepassId: {
+                    universeId: universeId,
+                    gamepassId
                 }
-            });
-            if (!purchaseSource) {
-                return reply.notFound("Gamepass not registered in system.");
+            },
+            include: {
+                licenseType: true
             }
-            // Check if user already has a license for this gamepass
-            const existingLicense = await prisma.license.findFirst({
+        });
+        if (!purchaseSource) {
+            return reply.notFound("Gamepass not registered in system.");
+        }
+        try {
+            // A Game Pass may create only one transferable license, ever.
+            // The license may be traded, but the original buyer must not claim another.
+            const previousClaim = await prisma.purchase.findFirst({
                 where: {
-                    ownerUserId: userId,
-                    licenseTypeId: purchaseSource.licenseTypeId,
-                    status: LicenseStatus.ACTIVE
+                    buyerUserId: userId,
+                    licenseTypeId: purchaseSource.licenseTypeId
                 },
-                include: {
-                    licenseType: true
+                orderBy: {
+                    createdAt: "asc"
                 }
             });
-            if (existingLicense) {
+            if (previousClaim) {
+                const originalLicense = await prisma.license.findFirst({
+                    where: {
+                        createdFromPurchaseId: previousClaim.id
+                    },
+                    select: {
+                        id: true,
+                        licenseTypeId: true
+                    }
+                });
+                if (!originalLicense) {
+                    request.log.error({
+                        purchaseId: previousClaim.id,
+                        buyerUserId: previousClaim.buyerUserId,
+                        licenseTypeId: previousClaim.licenseTypeId
+                    }, "Database inconsistency: purchase exists but no associated license found");
+                    return reply.internalServerError("Database inconsistency: purchase without associated license");
+                }
                 return reply.send({
                     data: {
                         success: true,
                         alreadyClaimed: true,
-                        licenseId: existingLicense.id,
-                        licenseTypeId: existingLicense.licenseTypeId,
-                        displayName: existingLicense.licenseType?.displayName
+                        licenseId: originalLicense.id,
+                        licenseTypeId: purchaseSource.licenseTypeId,
+                        displayName: purchaseSource.licenseType.displayName
                     }
                 });
             }
@@ -545,6 +566,31 @@ export async function registerLicenseRoutes(app) {
         catch (error) {
             request.log.error(error);
             if (error instanceof Error) {
+                // Handle Prisma P2002 duplicate-key error (race condition)
+                if (error.message.includes("P2002") || error.message.includes("unique constraint")) {
+                    // Find the existing license for this user and license type
+                    const existingLicense = await prisma.license.findFirst({
+                        where: {
+                            ownerUserId: userId,
+                            licenseTypeId: purchaseSource.licenseTypeId,
+                            status: LicenseStatus.ACTIVE
+                        },
+                        include: {
+                            licenseType: true
+                        }
+                    });
+                    if (existingLicense) {
+                        return reply.send({
+                            data: {
+                                success: true,
+                                alreadyClaimed: true,
+                                licenseId: existingLicense.id,
+                                licenseTypeId: existingLicense.licenseTypeId,
+                                displayName: existingLicense.licenseType?.displayName
+                            }
+                        });
+                    }
+                }
                 return reply.internalServerError(error.message);
             }
             throw error;
