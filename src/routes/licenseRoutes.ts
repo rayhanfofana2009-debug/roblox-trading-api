@@ -516,13 +516,15 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
   });
 
   app.post("/v1/license/claim", async (request, reply) => {
-    request.log.info({
-      userId: request.body?.userId,
-      gamepassId: request.body?.gamepassId,
-      universeId: request.body?.universeId
-    }, "Incoming claim request");
-
     const parsedBody = claimBody.safeParse(request.body);
+
+    if (parsedBody.success) {
+      request.log.info({
+        userId: parsedBody.data.userId,
+        gamepassId: parsedBody.data.gamepassId,
+        universeId: parsedBody.data.universeId
+      }, "Incoming claim request");
+    }
     if (!parsedBody.success) {
       request.log.error({
         errors: parsedBody.error.flatten()
