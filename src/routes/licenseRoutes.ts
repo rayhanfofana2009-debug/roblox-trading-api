@@ -37,10 +37,9 @@ const tradeHistoryQuery = z.object({
 });
 
 const claimBody = z.object({
-    userId: z.coerce.bigint(),
-    gamepassId: z.coerce.bigint(),
-    universeId: z.coerce.bigint(),
-    secret: z.string()
+  userId: z.coerce.bigint(),
+  gamepassId: z.coerce.bigint(),
+  universeId: z.coerce.bigint()
 });
 
 const executeTradeBody = z.object({
@@ -100,6 +99,22 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
     }
 
     const { userId, licenseTypeId } = parsedQuery.data;
+
+    // A scoped per-game key may only verify license types tied to its own
+    // universe. The master API_KEY is unrestricted.
+    if (request.apiClient) {
+      const ownedByClientUniverse = await prisma.purchaseSource.findFirst({
+        where: {
+          licenseTypeId,
+          universeId: request.apiClient.allowedUniverseId
+        },
+        select: { id: true }
+      });
+
+      if (!ownedByClientUniverse) {
+        return reply.status(403).send({ error: "This key is not authorized for this license type." });
+      }
+    }
 
     const activeLicense = await prisma.license.findFirst({
       where: {
@@ -535,12 +550,12 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
       });
     }
 
-    const { userId, gamepassId, universeId, secret } = parsedBody.data;
+    const { userId, gamepassId, universeId } = parsedBody.data;
 
-    // Verify secret (you should set this as an environment variable)
-    const expectedSecret = process.env.CLAIM_SECRET || "your-claim-secret-change-this";
-    if (secret !== expectedSecret) {
-      return reply.unauthorized("Invalid secret.");
+        // A scoped per-game key may only claim for its own universe.
+        // The master API_KEY (request.apiClient undefined) is unrestricted.
+        if (request.apiClient && request.apiClient.allowedUniverseId !== universeId) {
+          return reply.status(403).send({ error: "This key is not authorized for this universe." });
     }
 
     // Find purchase source for this gamepass (needed for error handling)

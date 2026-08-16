@@ -124,3 +124,11 @@ model OwnershipEvent {
   @@index([licenseId, createdAt])
   @@index([toUserId, createdAt])
 }
+
+model ApiClient {
+  id                String   @id @default(uuid())
+  name              String
+  keyHash           String   @unique
+  allowedUniverseId BigInt
+  createdAt         DateTime @default(now())
+}
