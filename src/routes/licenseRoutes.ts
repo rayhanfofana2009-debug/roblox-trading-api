@@ -1,7 +1,7 @@
 import { FastifyInstance } from "fastify";
 import { prisma } from "../db.js";
 import { z } from "zod";
-import { LicenseOrigin, LicenseStatus, TradeSide, TradeStatus } from "@prisma/client";
+import { LicenseOrigin, LicenseStatus, Prisma, TradeSide, TradeStatus } from "@prisma/client";
 
 const playerParams = z.object({
   userId: z.coerce.bigint()
@@ -49,6 +49,41 @@ const executeTradeBody = z.object({
   fromLicenses: z.array(z.string().uuid()),
   toLicenses: z.array(z.string().uuid())
 });
+
+function getCurrentMonthStart(): Date {
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+}
+
+async function incrementTradeEventCount(tx: Prisma.TransactionClient, sourceId: string) {
+  const currentMonthStart = getCurrentMonthStart();
+  const source = await tx.purchaseSource.findUnique({
+    where: { id: sourceId },
+    select: { countPeriodStart: true }
+  });
+
+  if (!source) {
+    return;
+  }
+
+  if (source.countPeriodStart.getTime() < currentMonthStart.getTime()) {
+    await tx.purchaseSource.update({
+      where: { id: sourceId },
+      data: {
+        tradeEventCount: 1,
+        countPeriodStart: currentMonthStart
+      }
+    });
+    return;
+  }
+
+  await tx.purchaseSource.update({
+    where: { id: sourceId },
+    data: {
+      tradeEventCount: { increment: 1 }
+    }
+  });
+}
 
 export async function registerLicenseRoutes(app: FastifyInstance) {
   app.get("/v1/players/:userId/licenses", async (request, reply) => {
@@ -445,6 +480,48 @@ export async function registerLicenseRoutes(app: FastifyInstance) {
             fromUserId: originalOwner.toString(),
             toUserId: newOwner.toString()
           });
+        }
+
+        const fromTypeIds = [...new Set(
+          lockedLicenses
+            .filter((license) => fromLicenses.includes(license.id))
+            .map((license) => license.licenseTypeId)
+        )];
+        const toTypeIds = [...new Set(
+          lockedLicenses
+            .filter((license) => toLicenses.includes(license.id))
+            .map((license) => license.licenseTypeId)
+        )];
+
+        const allTypeIds = [...new Set([...fromTypeIds, ...toTypeIds])];
+        const sources = await tx.purchaseSource.findMany({
+          where: {
+            licenseTypeId: { in: allTypeIds }
+          },
+          select: {
+            id: true,
+            licenseTypeId: true
+          }
+        });
+        const sourceIdByTypeId = new Map(sources.map((source) => [source.licenseTypeId, source.id]));
+
+        const fromSourceIds = [...new Set(
+          fromTypeIds
+            .map((typeId) => sourceIdByTypeId.get(typeId))
+            .filter((sourceId): sourceId is string => Boolean(sourceId))
+        )];
+        const toSourceIds = [...new Set(
+          toTypeIds
+            .map((typeId) => sourceIdByTypeId.get(typeId))
+            .filter((sourceId): sourceId is string => Boolean(sourceId))
+        )];
+
+        for (const sourceId of fromSourceIds) {
+          await incrementTradeEventCount(tx, sourceId);
+        }
+
+        for (const sourceId of toSourceIds) {
+          await incrementTradeEventCount(tx, sourceId);
         }
 
         return { trade, transferredLicenses };

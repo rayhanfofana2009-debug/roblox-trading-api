@@ -30,8 +30,7 @@ const tradeHistoryQuery = z.object({
 const claimBody = z.object({
     userId: z.coerce.bigint(),
     gamepassId: z.coerce.bigint(),
-    universeId: z.coerce.bigint(),
-    secret: z.string()
+    universeId: z.coerce.bigint()
 });
 const executeTradeBody = z.object({
     fromUserId: z.coerce.bigint(),
@@ -40,6 +39,36 @@ const executeTradeBody = z.object({
     fromLicenses: z.array(z.string().uuid()),
     toLicenses: z.array(z.string().uuid())
 });
+function getCurrentMonthStart() {
+    const now = new Date();
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+}
+async function incrementTradeEventCount(tx, sourceId) {
+    const currentMonthStart = getCurrentMonthStart();
+    const source = await tx.purchaseSource.findUnique({
+        where: { id: sourceId },
+        select: { countPeriodStart: true }
+    });
+    if (!source) {
+        return;
+    }
+    if (source.countPeriodStart.getTime() < currentMonthStart.getTime()) {
+        await tx.purchaseSource.update({
+            where: { id: sourceId },
+            data: {
+                tradeEventCount: 1,
+                countPeriodStart: currentMonthStart
+            }
+        });
+        return;
+    }
+    await tx.purchaseSource.update({
+        where: { id: sourceId },
+        data: {
+            tradeEventCount: { increment: 1 }
+        }
+    });
+}
 export async function registerLicenseRoutes(app) {
     app.get("/v1/players/:userId/licenses", async (request, reply) => {
         const parsedParams = playerParams.safeParse(request.params);
@@ -83,6 +112,20 @@ export async function registerLicenseRoutes(app) {
             return reply.badRequest("Invalid query.");
         }
         const { userId, licenseTypeId } = parsedQuery.data;
+        // A scoped per-game key may only verify license types tied to its own
+        // universe. The master API_KEY is unrestricted.
+        if (request.apiClient) {
+            const ownedByClientUniverse = await prisma.purchaseSource.findFirst({
+                where: {
+                    licenseTypeId,
+                    universeId: request.apiClient.allowedUniverseId
+                },
+                select: { id: true }
+            });
+            if (!ownedByClientUniverse) {
+                return reply.status(403).send({ error: "This key is not authorized for this license type." });
+            }
+        }
         const activeLicense = await prisma.license.findFirst({
             where: {
                 ownerUserId: userId,
@@ -368,6 +411,35 @@ export async function registerLicenseRoutes(app) {
                         toUserId: newOwner.toString()
                     });
                 }
+                const fromTypeIds = [...new Set(lockedLicenses
+                        .filter((license) => fromLicenses.includes(license.id))
+                        .map((license) => license.licenseTypeId))];
+                const toTypeIds = [...new Set(lockedLicenses
+                        .filter((license) => toLicenses.includes(license.id))
+                        .map((license) => license.licenseTypeId))];
+                const allTypeIds = [...new Set([...fromTypeIds, ...toTypeIds])];
+                const sources = await tx.purchaseSource.findMany({
+                    where: {
+                        licenseTypeId: { in: allTypeIds }
+                    },
+                    select: {
+                        id: true,
+                        licenseTypeId: true
+                    }
+                });
+                const sourceIdByTypeId = new Map(sources.map((source) => [source.licenseTypeId, source.id]));
+                const fromSourceIds = [...new Set(fromTypeIds
+                        .map((typeId) => sourceIdByTypeId.get(typeId))
+                        .filter((sourceId) => Boolean(sourceId)))];
+                const toSourceIds = [...new Set(toTypeIds
+                        .map((typeId) => sourceIdByTypeId.get(typeId))
+                        .filter((sourceId) => Boolean(sourceId)))];
+                for (const sourceId of fromSourceIds) {
+                    await incrementTradeEventCount(tx, sourceId);
+                }
+                for (const sourceId of toSourceIds) {
+                    await incrementTradeEventCount(tx, sourceId);
+                }
                 return { trade, transferredLicenses };
             });
             return reply.send({
@@ -462,11 +534,11 @@ export async function registerLicenseRoutes(app) {
                 error: parsedBody.error.flatten()
             });
         }
-        const { userId, gamepassId, universeId, secret } = parsedBody.data;
-        // Verify secret (you should set this as an environment variable)
-        const expectedSecret = process.env.CLAIM_SECRET || "your-claim-secret-change-this";
-        if (secret !== expectedSecret) {
-            return reply.unauthorized("Invalid secret.");
+        const { userId, gamepassId, universeId } = parsedBody.data;
+        // A scoped per-game key may only claim for its own universe.
+        // The master API_KEY (request.apiClient undefined) is unrestricted.
+        if (request.apiClient && request.apiClient.allowedUniverseId !== universeId) {
+            return reply.status(403).send({ error: "This key is not authorized for this universe." });
         }
         // Find purchase source for this gamepass (needed for error handling)
         const purchaseSource = await prisma.purchaseSource.findUnique({
